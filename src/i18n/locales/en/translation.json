@@ -385,6 +385,12 @@
           "description": "API key for the selected provider.",
           "placeholder": "sk-..."
         },
+        "authMethod": {
+          "title": "Auth Method",
+          "description": "How the API key is sent. Bearer Token uses the Authorization header (most OpenAI-compatible APIs). x-api-key sends the raw key in an x-api-key header (Anthropic, AWS API Gateway, some custom gateways).",
+          "bearerToken": "Bearer Token (Authorization)",
+          "xApiKey": "x-api-key"
+        },
         "model": {
           "title": "Model",
           "descriptionApple": "Provide an optional numeric token limit or keep the default on-device preset.",
@@ -415,7 +421,17 @@
         "createPrompt": "Create Prompt",
         "cancel": "Cancel",
         "selectToEdit": "Select a prompt above to view and edit its details.",
-        "createFirst": "Click 'Create New Prompt' above to create your first post-processing prompt."
+        "createFirst": "Click 'Create New Prompt' above to create your first post-processing prompt.",
+        "chord": {
+          "label": "Chord",
+          "description": "Number of taps on the transcribe shortcut to invoke this prompt. Tap once to record without post-processing; tap-and-hold to start.",
+          "none": "Not bound",
+          "doubleTap": "Double-tap",
+          "tripleTap": "Triple-tap",
+          "quadrupleTap": "Quadruple-tap",
+          "quintupleTap": "Quintuple-tap",
+          "updateError": "Could not update chord: {{message}}"
+        }
       }
     },
     "history": {

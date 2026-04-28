@@ -39,15 +39,17 @@ impl Drop for FinishGuard {
 }
 
 // Shortcut Action Trait
+//
+// `preset` is the resolved post-processing preset (prompt id) for actions
+// that care; the chord state machine determines it from tap count. Non-
+// transcribe actions ignore it.
 pub trait ShortcutAction: Send + Sync {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
-    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, preset: Option<&str>);
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, preset: Option<&str>);
 }
 
-// Transcribe Action
-struct TranscribeAction {
-    post_process: bool,
-}
+// Transcribe Action — singleton; preset is supplied per-invocation.
+struct TranscribeAction;
 
 /// Field name for structured output JSON schema
 const TRANSCRIPTION_FIELD: &str = "transcription";
@@ -63,7 +65,22 @@ fn build_system_prompt(prompt_template: &str) -> String {
     prompt_template.replace("${output}", "").trim().to_string()
 }
 
-async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+/// Run the configured LLM provider against `transcription` using `prompt`.
+///
+/// `prompt` is the literal prompt template (with `${output}` placeholder). The
+/// caller resolves which prompt to apply (chord preset, history re-run, etc.)
+/// — this function no longer reads `settings.post_process_selected_prompt_id`,
+/// which is being phased out by the chord migration.
+async fn post_process_transcription(
+    settings: &AppSettings,
+    transcription: &str,
+    prompt: &str,
+) -> Option<String> {
+    if prompt.trim().is_empty() {
+        debug!("Post-processing skipped because the prompt is empty");
+        return None;
+    }
+
     let provider = match settings.active_post_process_provider().cloned() {
         Some(provider) => provider,
         None => {
@@ -86,33 +103,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         return None;
     }
 
-    let selected_prompt_id = match &settings.post_process_selected_prompt_id {
-        Some(id) => id.clone(),
-        None => {
-            debug!("Post-processing skipped because no prompt is selected");
-            return None;
-        }
-    };
-
-    let prompt = match settings
-        .post_process_prompts
-        .iter()
-        .find(|prompt| prompt.id == selected_prompt_id)
-    {
-        Some(prompt) => prompt.prompt.clone(),
-        None => {
-            debug!(
-                "Post-processing skipped because prompt '{}' was not found",
-                selected_prompt_id
-            );
-            return None;
-        }
-    };
-
-    if prompt.trim().is_empty() {
-        debug!("Post-processing skipped because the selected prompt is empty");
-        return None;
-    }
+    let prompt = prompt.to_string();
 
     debug!(
         "Starting LLM post-processing with provider '{}' (model: {})",
@@ -125,12 +116,17 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         .cloned()
         .unwrap_or_default();
 
-    // Disable reasoning for providers where post-processing rarely benefits from it.
-    // - custom: top-level reasoning_effort (works for local OpenAI-compat servers)
-    // - openrouter: nested reasoning object; exclude:true also keeps reasoning text
-    //   out of the response so it can't pollute structured-output JSON parsing
+    // Disable reasoning for providers where post-processing rarely benefits
+    // from it. The "custom" provider is heterogeneous (could be a local
+    // OpenAI-compat server, an Anthropic-routing gateway, etc.); sending the
+    // reasoning_effort hint for "custom" was a 400 trap for gateways that
+    // strictly reject unknown fields, so we don't add anything by default
+    // there and let the upstream service choose its own behavior.
+    //
+    // OpenRouter's nested `reasoning` object with `exclude:true` keeps any
+    // reasoning text out of the response so it can't pollute structured-
+    // output JSON parsing.
     let (reasoning_effort, reasoning) = match provider.id.as_str() {
-        "custom" => (Some("none".to_string()), None),
         "openrouter" => (
             None,
             Some(crate::llm_client::ReasoningConfig {
@@ -346,10 +342,16 @@ pub(crate) struct ProcessedTranscription {
     pub post_process_prompt: Option<String>,
 }
 
+/// Apply post-transcription processing — Chinese variant conversion always,
+/// LLM post-processing if a `preset` (prompt id) is supplied.
+///
+/// `preset == None` is plain transcription (no LLM dispatch). The caller
+/// chooses the preset: typically the chord state machine's resolved id, or
+/// — for history re-runs — the user's current double-tap preset.
 pub(crate) async fn process_transcription_output(
     app: &AppHandle,
     transcription: &str,
-    post_process: bool,
+    preset: Option<String>,
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
     let mut final_text = transcription.to_string();
@@ -360,22 +362,29 @@ pub(crate) async fn process_transcription_output(
         final_text = converted_text;
     }
 
-    if post_process {
-        if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
-            post_processed_text = Some(processed_text.clone());
-            final_text = processed_text;
+    if let Some(prompt_id) = preset {
+        let prompt_text = settings
+            .post_process_prompts
+            .iter()
+            .find(|p| p.id == prompt_id)
+            .map(|p| p.prompt.clone());
 
-            if let Some(prompt_id) = &settings.post_process_selected_prompt_id {
-                if let Some(prompt) = settings
-                    .post_process_prompts
-                    .iter()
-                    .find(|prompt| &prompt.id == prompt_id)
-                {
-                    post_process_prompt = Some(prompt.prompt.clone());
-                }
+        if let Some(prompt_text) = prompt_text {
+            if let Some(processed_text) =
+                post_process_transcription(&settings, &final_text, &prompt_text).await
+            {
+                post_processed_text = Some(processed_text.clone());
+                final_text = processed_text;
+                post_process_prompt = Some(prompt_text);
             }
+        } else {
+            debug!(
+                "Post-processing skipped because preset prompt '{}' was not found",
+                prompt_id
+            );
         }
     } else if final_text != transcription {
+        // Chinese conversion ran but no LLM step — surface the converted text.
         post_processed_text = Some(final_text.clone());
     }
 
@@ -387,7 +396,7 @@ pub(crate) async fn process_transcription_output(
 }
 
 impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, _preset: Option<&str>) {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
@@ -489,7 +498,7 @@ impl ShortcutAction for TranscribeAction {
         );
     }
 
-    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, preset: Option<&str>) {
         // Unregister the cancel shortcut when transcription stops
         shortcut::unregister_cancel_shortcut(app);
 
@@ -511,7 +520,10 @@ impl ShortcutAction for TranscribeAction {
         play_feedback_sound(app, SoundType::Stop);
 
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
-        let post_process = self.post_process;
+                                                 // Own the preset for the async closure; `post_process` is the historical
+                                                 // bool flag still expected by the history schema.
+        let preset = preset.map(String::from);
+        let post_process = preset.is_some();
 
         tauri::async_runtime::spawn(async move {
             let _guard = FinishGuard(ah.clone());
@@ -583,7 +595,7 @@ impl ShortcutAction for TranscribeAction {
                                 show_processing_overlay(&ah);
                             }
                             let processed =
-                                process_transcription_output(&ah, &transcription, post_process)
+                                process_transcription_output(&ah, &transcription, preset.clone())
                                     .await;
 
                             // Save to history if WAV was saved
@@ -664,11 +676,23 @@ impl ShortcutAction for TranscribeAction {
 struct CancelAction;
 
 impl ShortcutAction for CancelAction {
-    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+    fn start(
+        &self,
+        app: &AppHandle,
+        _binding_id: &str,
+        _shortcut_str: &str,
+        _preset: Option<&str>,
+    ) {
         utils::cancel_current_operation(app);
     }
 
-    fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+    fn stop(
+        &self,
+        _app: &AppHandle,
+        _binding_id: &str,
+        _shortcut_str: &str,
+        _preset: Option<&str>,
+    ) {
         // Nothing to do on stop for cancel
     }
 }
@@ -677,7 +701,7 @@ impl ShortcutAction for CancelAction {
 struct TestAction;
 
 impl ShortcutAction for TestAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, _preset: Option<&str>) {
         log::info!(
             "Shortcut ID '{}': Started - {} (App: {})", // Changed "Pressed" to "Started" for consistency
             binding_id,
@@ -686,7 +710,7 @@ impl ShortcutAction for TestAction {
         );
     }
 
-    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, _preset: Option<&str>) {
         log::info!(
             "Shortcut ID '{}': Stopped - {} (App: {})", // Changed "Released" to "Stopped" for consistency
             binding_id,
@@ -701,13 +725,7 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
     let mut map = HashMap::new();
     map.insert(
         "transcribe".to_string(),
-        Arc::new(TranscribeAction {
-            post_process: false,
-        }) as Arc<dyn ShortcutAction>,
-    );
-    map.insert(
-        "transcribe_with_post_process".to_string(),
-        Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,
+        Arc::new(TranscribeAction) as Arc<dyn ShortcutAction>,
     );
     map.insert(
         "cancel".to_string(),

@@ -3,6 +3,7 @@ mod actions;
 mod apple_intelligence;
 mod audio_feedback;
 pub mod audio_toolkit;
+mod chord_state;
 pub mod cli;
 mod clipboard;
 mod commands;
@@ -355,7 +356,9 @@ pub fn run(cli_args: CliArgs) {
             shortcut::fetch_post_process_models,
             shortcut::add_post_process_prompt,
             shortcut::update_post_process_prompt,
+            shortcut::set_post_process_prompt_chord,
             shortcut::delete_post_process_prompt,
+            shortcut::change_post_process_auth_method_setting,
             shortcut::set_post_process_selected_prompt,
             shortcut::update_custom_words,
             shortcut::suspend_binding,
@@ -484,7 +487,12 @@ pub fn run(cli_args: CliArgs) {
             if args.iter().any(|a| a == "--toggle-transcription") {
                 signal_handle::send_transcription_input(app, "transcribe", "CLI");
             } else if args.iter().any(|a| a == "--toggle-post-process") {
-                signal_handle::send_transcription_input(app, "transcribe_with_post_process", "CLI");
+                // Legacy flag — the chord system has no direct equivalent yet.
+                // Route to the regular transcribe binding so recording still
+                // happens; post-processing is now driven by tap-count chord
+                // and currently can't be requested over this single-shot CLI.
+                // TODO(chord-system): plumb a preset hint through send_input.
+                signal_handle::send_transcription_input(app, "transcribe", "CLI");
             } else if args.iter().any(|a| a == "--cancel") {
                 crate::utils::cancel_current_operation(app);
             } else {

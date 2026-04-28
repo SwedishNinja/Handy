@@ -52,19 +52,23 @@ pub fn handle_shortcut_event(
         return;
     };
 
+    // Non-transcribe actions don't go through the chord state machine, so
+    // they have no preset to apply.
+    let preset: Option<&str> = None;
+
     // Cancel binding: only fires when recording and key is pressed
     if binding_id == "cancel" {
         let audio_manager = app.state::<Arc<AudioRecordingManager>>();
         if audio_manager.is_recording() && is_pressed {
-            action.start(app, binding_id, hotkey_string);
+            action.start(app, binding_id, hotkey_string, preset);
         }
         return;
     }
 
     // Remaining bindings (e.g. "test") use simple start/stop on press/release.
     if is_pressed {
-        action.start(app, binding_id, hotkey_string);
+        action.start(app, binding_id, hotkey_string, preset);
     } else {
-        action.stop(app, binding_id, hotkey_string);
+        action.stop(app, binding_id, hotkey_string, preset);
     }
 }

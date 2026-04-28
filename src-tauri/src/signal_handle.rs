@@ -27,7 +27,13 @@ pub fn setup_signal_handler(app_handle: AppHandle, mut signals: Signals) {
     thread::spawn(move || {
         for sig in signals.forever() {
             let (binding_id, signal_name) = match sig {
-                SIGUSR1 => ("transcribe_with_post_process", "SIGUSR1"),
+                // SIGUSR1 was the legacy "transcribe with post-processing"
+                // trigger. The chord system has no equivalent single-shot
+                // entry point yet; we route to the regular transcribe so the
+                // signal still drives recording. Post-processing is reached
+                // via tap-count chord on the keyboard shortcut.
+                // TODO(chord-system): plumb a preset hint through send_input.
+                SIGUSR1 => ("transcribe", "SIGUSR1"),
                 SIGUSR2 => ("transcribe", "SIGUSR2"),
                 _ => continue,
             };

@@ -248,9 +248,42 @@ async updatePostProcessPrompt(id: string, name: string, prompt: string) : Promis
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Set or clear the chord (tap-count assignment) of a post-process prompt.
+ * 
+ * `tap_count = None` → unbind (no chord, prompt can't be invoked by chord).
+ * `tap_count = Some(n)` (n >= 2) → bind the prompt to that tap count, e.g.
+ * `Some(2)` for double-tap, `Some(3)` for triple-tap.
+ * 
+ * Returns `Err(...)` with a human-readable message if another prompt already
+ * owns that tap count — caller should surface that to the user.
+ */
+async setPostProcessPromptChord(id: string, tapCount: number | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_post_process_prompt_chord", { id, tapCount }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async deletePostProcessPrompt(id: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_post_process_prompt", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Update a provider's auth method (Bearer Token vs x-api-key).
+ * 
+ * Only the `custom` provider is user-configurable; built-in providers have
+ * their auth scheme dictated by the vendor's API and are reset on every
+ * settings load by `ensure_post_process_defaults`.
+ */
+async changePostProcessAuthMethodSetting(providerId: string, method: AuthMethod) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_post_process_auth_method_setting", { providerId, method }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -802,10 +835,8 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
 }
 },
 /**
- * Checks if the Mac is a laptop by detecting battery presence
- * 
- * This uses pmset to check for battery information.
- * Returns true if a battery is detected (laptop), false otherwise (desktop)
+ * Stub implementation for non-macOS platforms
+ * Always returns false since laptop detection is macOS-specific
  */
 async isLaptop() : Promise<Result<boolean, string>> {
     try {
@@ -834,6 +865,16 @@ historyUpdatePayload: "history-update-payload"
 
 export type AppSettings = { bindings: Partial<{ [key in string]: ShortcutBinding }>; push_to_talk: boolean; audio_feedback: boolean; audio_feedback_volume?: number; sound_theme?: SoundTheme; start_hidden?: boolean; autostart_enabled?: boolean; update_checks_enabled?: boolean; selected_model?: string; always_on_microphone?: boolean; selected_microphone?: string | null; clamshell_microphone?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; append_trailing_space?: boolean; app_language?: string; experimental_enabled?: boolean; lazy_stream_close?: boolean; keyboard_implementation?: KeyboardImplementation; show_tray_icon?: boolean; paste_delay_ms?: number; typing_tool?: TypingTool; external_script_path: string | null; custom_filler_words?: string[] | null; whisper_accelerator?: WhisperAcceleratorSetting; ort_accelerator?: OrtAcceleratorSetting; whisper_gpu_device?: number; extra_recording_buffer_ms?: number }
 export type AudioDevice = { index: string; name: string; is_default: boolean }
+/**
+ * How the API key is sent to the LLM provider.
+ * 
+ * Most OpenAI-compatible APIs use `Authorization: Bearer <key>`. Anthropic
+ * uses `x-api-key: <key>`. Some custom gateways (e.g. AWS API Gateway with
+ * API-key auth, or vendor-specific) require `x-api-key`. Each provider's
+ * auth scheme is fixed by its vendor, except `custom` where the user picks
+ * to match whatever their gateway expects.
+ */
+export type AuthMethod = "bearer_token" | "x_api_key"
 export type AutoSubmitKey = "enter" | "ctrl_enter" | "cmd_enter"
 export type AvailableAccelerators = { whisper: string[]; ort: string[]; gpu_devices: GpuDeviceOption[] }
 export type BindingResponse = { success: boolean; binding: ShortcutBinding | null; error: string | null }
@@ -852,7 +893,13 @@ export type ImplementationChangeResult = { success: boolean;
  */
 reset_bindings: string[] }
 export type KeyboardImplementation = "tauri" | "handy_keys"
-export type LLMPrompt = { id: string; name: string; prompt: string }
+export type LLMPrompt = { id: string; name: string; prompt: string; 
+/**
+ * Chord assignment for this preset. `None` means the preset is configured
+ * but not currently bound to any tap-count. Persisted settings written
+ * before the chord migration won't have this field; serde defaults it.
+ */
+chord?: PresetChord | null }
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error"
 export type ModelInfo = { id: string; name: string; description: string; filename: string; url: string | null; sha256: string | null; size_mb: number; is_downloaded: boolean; is_downloading: boolean; partial_size: number; is_directory: boolean; engine_type: EngineType; accuracy_score: number; speed_score: number; supports_translation: boolean; is_recommended: boolean; supported_languages: string[]; supports_language_selection: boolean; is_custom: boolean }
 export type ModelLoadStatus = { is_loaded: boolean; current_model: string | null }
@@ -862,7 +909,15 @@ export type OverlayPosition = "none" | "top" | "bottom"
 export type PaginatedHistory = { entries: HistoryEntry[]; has_more: boolean }
 export type PasteMethod = "ctrl_v" | "direct" | "none" | "shift_insert" | "ctrl_shift_v" | "external_script"
 export type PermissionAccess = "allowed" | "denied" | "unknown"
-export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean }
+export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean; auth_method?: AuthMethod }
+/**
+ * A chord configuration for selecting an `LLMPrompt` via tap-count.
+ * 
+ * `tap_count` is the number of times the user taps the transcribe shortcut
+ * before holding/recording. `1` is implicitly plain transcription (no preset);
+ * `2` = double-tap, `3` = triple-tap, etc.
+ */
+export type PresetChord = { tap_count: number }
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
 export type SecretMap = Partial<{ [key in string]: string }>
 export type ShortcutBinding = { id: string; name: string; description: string; default_binding: string; current_binding: string }

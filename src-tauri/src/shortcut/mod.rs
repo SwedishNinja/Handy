@@ -853,6 +853,40 @@ pub fn change_post_process_base_url_setting(
     Ok(())
 }
 
+/// Update a provider's auth method (Bearer Token vs x-api-key).
+///
+/// Only the `custom` provider is user-configurable; built-in providers have
+/// their auth scheme dictated by the vendor's API and are reset on every
+/// settings load by `ensure_post_process_defaults`.
+#[tauri::command]
+#[specta::specta]
+pub fn change_post_process_auth_method_setting(
+    app: AppHandle,
+    provider_id: String,
+    method: settings::AuthMethod,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    let label = settings
+        .post_process_provider(&provider_id)
+        .map(|p| p.label.clone())
+        .ok_or_else(|| format!("Provider '{}' not found", provider_id))?;
+
+    let provider = settings
+        .post_process_provider_mut(&provider_id)
+        .expect("Provider looked up above must exist");
+
+    if provider.id != "custom" {
+        return Err(format!(
+            "Provider '{}' does not allow changing the auth method",
+            label
+        ));
+    }
+
+    provider.auth_method = method;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
 /// Generic helper to validate provider exists
 fn validate_provider_exists(
     settings: &settings::AppSettings,
@@ -922,6 +956,7 @@ pub fn add_post_process_prompt(
         id: id.clone(),
         name,
         prompt,
+        chord: None,
     };
 
     settings.post_process_prompts.push(new_prompt.clone());
@@ -952,6 +987,55 @@ pub fn update_post_process_prompt(
     } else {
         Err(format!("Prompt with id '{}' not found", id))
     }
+}
+
+/// Set or clear the chord (tap-count assignment) of a post-process prompt.
+///
+/// `tap_count = None` → unbind (no chord, prompt can't be invoked by chord).
+/// `tap_count = Some(n)` (n >= 2) → bind the prompt to that tap count, e.g.
+/// `Some(2)` for double-tap, `Some(3)` for triple-tap.
+///
+/// Returns `Err(...)` with a human-readable message if another prompt already
+/// owns that tap count — caller should surface that to the user.
+#[tauri::command]
+#[specta::specta]
+pub fn set_post_process_prompt_chord(
+    app: AppHandle,
+    id: String,
+    tap_count: Option<u32>,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+
+    if let Some(count) = tap_count {
+        if count < 2 {
+            return Err(format!(
+                "Tap count must be 2 or greater (got {count}); use `null` to unbind."
+            ));
+        }
+        if let Some(other_id) = settings.chord_conflict(&id, count) {
+            let other_name = settings
+                .post_process_prompts
+                .iter()
+                .find(|p| p.id == other_id)
+                .map(|p| p.name.clone())
+                .unwrap_or(other_id);
+            return Err(format!(
+                "Tap count {count} is already used by '{other_name}'."
+            ));
+        }
+    }
+
+    let Some(prompt) = settings
+        .post_process_prompts
+        .iter_mut()
+        .find(|p| p.id == id)
+    else {
+        return Err(format!("Prompt with id '{}' not found", id));
+    };
+
+    prompt.chord = tap_count.map(|tap_count| crate::settings::PresetChord { tap_count });
+    settings::write_settings(&app, settings);
+    Ok(())
 }
 
 #[tauri::command]

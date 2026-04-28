@@ -19,12 +19,12 @@ import { BaseUrlField } from "../PostProcessingSettingsApi/BaseUrlField";
 import { ApiKeyField } from "../PostProcessingSettingsApi/ApiKeyField";
 import { ModelSelect } from "../PostProcessingSettingsApi/ModelSelect";
 import { usePostProcessProviderState } from "../PostProcessingSettingsApi/usePostProcessProviderState";
-import { ShortcutInput } from "../ShortcutInput";
 import { useSettings } from "../../../hooks/useSettings";
 
 const PostProcessingSettingsApiComponent: React.FC = () => {
   const { t } = useTranslation();
   const state = usePostProcessProviderState();
+  const { refreshSettings } = useSettings();
 
   return (
     <>
@@ -53,25 +53,76 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
       ) : (
         <>
           {state.selectedProvider?.id === "custom" && (
-            <SettingContainer
-              title={t("settings.postProcessing.api.baseUrl.title")}
-              description={t("settings.postProcessing.api.baseUrl.description")}
-              descriptionMode="tooltip"
-              layout="horizontal"
-              grouped={true}
-            >
-              <div className="flex items-center gap-2">
-                <BaseUrlField
-                  value={state.baseUrl}
-                  onBlur={state.handleBaseUrlChange}
-                  placeholder={t(
-                    "settings.postProcessing.api.baseUrl.placeholder",
-                  )}
-                  disabled={state.isBaseUrlUpdating}
-                  className="min-w-[380px]"
+            <>
+              <SettingContainer
+                title={t("settings.postProcessing.api.baseUrl.title")}
+                description={t(
+                  "settings.postProcessing.api.baseUrl.description",
+                )}
+                descriptionMode="tooltip"
+                layout="horizontal"
+                grouped={true}
+              >
+                <div className="flex items-center gap-2">
+                  <BaseUrlField
+                    value={state.baseUrl}
+                    onBlur={state.handleBaseUrlChange}
+                    placeholder={t(
+                      "settings.postProcessing.api.baseUrl.placeholder",
+                    )}
+                    disabled={state.isBaseUrlUpdating}
+                    className="min-w-[380px]"
+                  />
+                </div>
+              </SettingContainer>
+
+              <SettingContainer
+                title={t("settings.postProcessing.api.authMethod.title")}
+                description={t(
+                  "settings.postProcessing.api.authMethod.description",
+                )}
+                descriptionMode="tooltip"
+                layout="horizontal"
+                grouped={true}
+              >
+                <Dropdown
+                  selectedValue={
+                    state.selectedProvider?.auth_method ?? "bearer_token"
+                  }
+                  options={[
+                    {
+                      value: "bearer_token",
+                      label: t(
+                        "settings.postProcessing.api.authMethod.bearerToken",
+                      ),
+                    },
+                    {
+                      value: "x_api_key",
+                      label: t(
+                        "settings.postProcessing.api.authMethod.xApiKey",
+                      ),
+                    },
+                  ]}
+                  onSelect={async (value) => {
+                    if (!value || !state.selectedProvider) return;
+                    const result =
+                      await commands.changePostProcessAuthMethodSetting(
+                        state.selectedProvider.id,
+                        value as "bearer_token" | "x_api_key",
+                      );
+                    if (result.status === "ok") {
+                      await refreshSettings();
+                    } else {
+                      console.error(
+                        "Failed to update auth method:",
+                        result.error,
+                      );
+                    }
+                  }}
+                  className="min-w-[200px]"
                 />
-              </div>
-            </SettingContainer>
+              </SettingContainer>
+            </>
           )}
 
           <SettingContainer
@@ -143,18 +194,41 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
   );
 };
 
+const CHORD_OPTIONS: { value: string; labelKey: string }[] = [
+  { value: "none", labelKey: "settings.postProcessing.prompts.chord.none" },
+  { value: "2", labelKey: "settings.postProcessing.prompts.chord.doubleTap" },
+  { value: "3", labelKey: "settings.postProcessing.prompts.chord.tripleTap" },
+  {
+    value: "4",
+    labelKey: "settings.postProcessing.prompts.chord.quadrupleTap",
+  },
+  {
+    value: "5",
+    labelKey: "settings.postProcessing.prompts.chord.quintupleTap",
+  },
+];
+
 const PostProcessingSettingsPromptsComponent: React.FC = () => {
   const { t } = useTranslation();
-  const { getSetting, updateSetting, isUpdating, refreshSettings } =
-    useSettings();
+  const { getSetting, refreshSettings } = useSettings();
   const [isCreating, setIsCreating] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [draftText, setDraftText] = useState("");
+  // Selection is purely a UI concern now — the chord on each prompt is the
+  // runtime trigger, not a global "selected prompt" setting.
+  const [selectedPromptId, setSelectedPromptId] = useState<string | null>(null);
+  const [chordError, setChordError] = useState<string | null>(null);
 
   const prompts = getSetting("post_process_prompts") || [];
-  const selectedPromptId = getSetting("post_process_selected_prompt_id") || "";
   const selectedPrompt =
     prompts.find((prompt) => prompt.id === selectedPromptId) || null;
+
+  // Default the selection to the first prompt once settings load.
+  useEffect(() => {
+    if (selectedPromptId === null && prompts.length > 0) {
+      setSelectedPromptId(prompts[0].id);
+    }
+  }, [prompts, selectedPromptId]);
 
   useEffect(() => {
     if (isCreating) return;
@@ -166,6 +240,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
       setDraftName("");
       setDraftText("");
     }
+    setChordError(null);
   }, [
     isCreating,
     selectedPromptId,
@@ -175,7 +250,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
 
   const handlePromptSelect = (promptId: string | null) => {
     if (!promptId) return;
-    updateSetting("post_process_selected_prompt_id", promptId);
+    setSelectedPromptId(promptId);
     setIsCreating(false);
   };
 
@@ -189,7 +264,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
       );
       if (result.status === "ok") {
         await refreshSettings();
-        updateSetting("post_process_selected_prompt_id", result.data.id);
+        setSelectedPromptId(result.data.id);
         setIsCreating(false);
       }
     } catch (error) {
@@ -218,11 +293,48 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
     try {
       await commands.deletePostProcessPrompt(promptId);
       await refreshSettings();
+      // If we deleted the currently-selected prompt, fall back to the first.
+      if (selectedPromptId === promptId) {
+        const remaining = prompts.filter((p) => p.id !== promptId);
+        setSelectedPromptId(remaining[0]?.id ?? null);
+      }
       setIsCreating(false);
     } catch (error) {
       console.error("Failed to delete prompt:", error);
     }
   };
+
+  const handleChordChange = async (promptId: string, value: string) => {
+    setChordError(null);
+    const tapCount = value === "none" ? null : parseInt(value, 10);
+    try {
+      const result = await commands.setPostProcessPromptChord(
+        promptId,
+        tapCount,
+      );
+      if (result.status === "ok") {
+        await refreshSettings();
+      } else {
+        setChordError(
+          t("settings.postProcessing.prompts.chord.updateError", {
+            message: result.error,
+          }),
+        );
+      }
+    } catch (error) {
+      console.error("Failed to update chord:", error);
+      setChordError(
+        t("settings.postProcessing.prompts.chord.updateError", {
+          message: String(error),
+        }),
+      );
+    }
+  };
+
+  const currentChordValue: string =
+    selectedPrompt?.chord?.tap_count != null
+      ? String(selectedPrompt.chord.tap_count)
+      : "none";
 
   const handleCancelCreate = () => {
     setIsCreating(false);
@@ -271,9 +383,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
                 ? t("settings.postProcessing.prompts.noPrompts")
                 : t("settings.postProcessing.prompts.selectPrompt")
             }
-            disabled={
-              isUpdating("post_process_selected_prompt_id") || isCreating
-            }
+            disabled={isCreating}
             className="flex-1"
           />
           <Button
@@ -305,6 +415,31 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
 
             <div className="space-y-2 flex flex-col">
               <label className="text-sm font-semibold">
+                {t("settings.postProcessing.prompts.chord.label")}
+              </label>
+              <Dropdown
+                selectedValue={currentChordValue}
+                options={CHORD_OPTIONS.map((opt) => ({
+                  value: opt.value,
+                  label: t(opt.labelKey),
+                }))}
+                onSelect={(value) =>
+                  value && handleChordChange(selectedPrompt.id, value)
+                }
+                className="w-full"
+              />
+              <p className="text-xs text-mid-gray/70">
+                {t("settings.postProcessing.prompts.chord.description")}
+              </p>
+              {chordError && (
+                <Alert variant="error" contained>
+                  {chordError}
+                </Alert>
+              )}
+            </div>
+
+            <div className="space-y-2 flex flex-col">
+              <label className="text-sm font-semibold">
                 {t("settings.postProcessing.prompts.promptInstructions")}
               </label>
               <Textarea
@@ -332,7 +467,9 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
                 {t("settings.postProcessing.prompts.updatePrompt")}
               </Button>
               <Button
-                onClick={() => handleDeletePrompt(selectedPromptId)}
+                onClick={() =>
+                  selectedPromptId && handleDeletePrompt(selectedPromptId)
+                }
                 variant="secondary"
                 size="md"
                 disabled={!selectedPromptId || prompts.length <= 1}
@@ -428,14 +565,6 @@ export const PostProcessingSettings: React.FC = () => {
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
-      <SettingsGroup title={t("settings.postProcessing.hotkey.title")}>
-        <ShortcutInput
-          shortcutId="transcribe_with_post_process"
-          descriptionMode="tooltip"
-          grouped={true}
-        />
-      </SettingsGroup>
-
       <SettingsGroup title={t("settings.postProcessing.api.title")}>
         <PostProcessingSettingsApi />
       </SettingsGroup>

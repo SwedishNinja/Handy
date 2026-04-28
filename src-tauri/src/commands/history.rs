@@ -93,8 +93,17 @@ pub async fn retry_history_entry_transcription(
         return Err("Recording contains no speech".to_string());
     }
 
-    let processed =
-        process_transcription_output(&app, &transcription, entry.post_process_requested).await;
+    // History entries from before the chord migration only stored a bool —
+    // we don't know which preset was originally used. Re-run with the user's
+    // current double-tap preset (the chord-system equivalent of "the default
+    // post-process"). If they have no double-tap preset configured, fall back
+    // to plain transcription.
+    let preset = if entry.post_process_requested {
+        crate::settings::get_settings(&app).preset_id_for_chord_count(2)
+    } else {
+        None
+    };
+    let processed = process_transcription_output(&app, &transcription, preset).await;
     history_manager
         .update_transcription(
             id,

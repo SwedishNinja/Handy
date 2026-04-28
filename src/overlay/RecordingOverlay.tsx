@@ -17,6 +17,7 @@ const RecordingOverlay: React.FC = () => {
   const { t } = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
   const [state, setState] = useState<OverlayState>("recording");
+  const [presetName, setPresetName] = useState<string | null>(null);
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
   const smoothedLevelsRef = useRef<number[]>(Array(16).fill(0));
   const direction = getLanguageDirection(i18n.language);
@@ -35,7 +36,18 @@ const RecordingOverlay: React.FC = () => {
       // Listen for hide-overlay event from Rust
       const unlistenHide = await listen("hide-overlay", () => {
         setIsVisible(false);
+        setPresetName(null);
       });
+
+      // Listen for chord-preset events from the coordinator. Payload is the
+      // resolved preset's display name, or null when starting a plain
+      // (no-post-process) recording.
+      const unlistenPreset = await listen<string | null>(
+        "chord-preset",
+        (event) => {
+          setPresetName(event.payload ?? null);
+        },
+      );
 
       // Listen for mic-level updates
       const unlistenLevel = await listen<number[]>("mic-level", (event) => {
@@ -55,6 +67,7 @@ const RecordingOverlay: React.FC = () => {
       return () => {
         unlistenShow();
         unlistenHide();
+        unlistenPreset();
         unlistenLevel();
       };
     };
@@ -78,7 +91,12 @@ const RecordingOverlay: React.FC = () => {
       <div className="overlay-left">{getIcon()}</div>
 
       <div className="overlay-middle">
-        {state === "recording" && (
+        {state === "recording" && presetName && (
+          <div className="preset-label" title={presetName}>
+            {presetName}
+          </div>
+        )}
+        {state === "recording" && !presetName && (
           <div className="bars-container">
             {levels.map((v, i) => (
               <div

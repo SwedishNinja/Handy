@@ -86,11 +86,46 @@ pub struct ShortcutBinding {
     pub current_binding: String,
 }
 
+/// A chord configuration for selecting an `LLMPrompt` via tap-count.
+///
+/// `tap_count` is the number of times the user taps the transcribe shortcut
+/// before holding/recording. `1` is implicitly plain transcription (no preset);
+/// `2` = double-tap, `3` = triple-tap, etc.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Type)]
+pub struct PresetChord {
+    pub tap_count: u32,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
 pub struct LLMPrompt {
     pub id: String,
     pub name: String,
     pub prompt: String,
+    /// Chord assignment for this preset. `None` means the preset is configured
+    /// but not currently bound to any tap-count. Persisted settings written
+    /// before the chord migration won't have this field; serde defaults it.
+    #[serde(default)]
+    pub chord: Option<PresetChord>,
+}
+
+/// How the API key is sent to the LLM provider.
+///
+/// Most OpenAI-compatible APIs use `Authorization: Bearer <key>`. Anthropic
+/// uses `x-api-key: <key>`. Some custom gateways (e.g. AWS API Gateway with
+/// API-key auth, or vendor-specific) require `x-api-key`. Each provider's
+/// auth scheme is fixed by its vendor, except `custom` where the user picks
+/// to match whatever their gateway expects.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    BearerToken,
+    XApiKey,
+}
+
+impl Default for AuthMethod {
+    fn default() -> Self {
+        AuthMethod::BearerToken
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
@@ -104,6 +139,8 @@ pub struct PostProcessProvider {
     pub models_endpoint: Option<String>,
     #[serde(default)]
     pub supports_structured_output: bool,
+    #[serde(default)]
+    pub auth_method: AuthMethod,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
@@ -530,6 +567,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+            auth_method: AuthMethod::BearerToken,
         },
         PostProcessProvider {
             id: "zai".to_string(),
@@ -538,6 +576,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+            auth_method: AuthMethod::BearerToken,
         },
         PostProcessProvider {
             id: "openrouter".to_string(),
@@ -546,6 +585,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+            auth_method: AuthMethod::BearerToken,
         },
         PostProcessProvider {
             id: "anthropic".to_string(),
@@ -554,6 +594,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: false,
+            auth_method: AuthMethod::XApiKey,
         },
         PostProcessProvider {
             id: "groq".to_string(),
@@ -562,6 +603,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: false,
+            auth_method: AuthMethod::BearerToken,
         },
         PostProcessProvider {
             id: "cerebras".to_string(),
@@ -570,6 +612,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+            auth_method: AuthMethod::BearerToken,
         },
     ];
 
@@ -586,6 +629,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: None,
             supports_structured_output: true,
+            auth_method: AuthMethod::BearerToken,
         });
     }
 
@@ -597,6 +641,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         allow_base_url_edit: false,
         models_endpoint: Some("/models".to_string()),
         supports_structured_output: true,
+        auth_method: AuthMethod::BearerToken,
     });
 
     // Custom provider always comes last
@@ -607,6 +652,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         allow_base_url_edit: true,
         models_endpoint: Some("/models".to_string()),
         supports_structured_output: false,
+        auth_method: AuthMethod::BearerToken,
     });
 
     providers
@@ -643,6 +689,7 @@ fn default_post_process_prompts() -> Vec<LLMPrompt> {
         id: "default_improve_transcriptions".to_string(),
         name: "Improve Transcriptions".to_string(),
         prompt: "Clean this transcript:\n1. Fix spelling, capitalization, and punctuation errors\n2. Convert number words to digits (twenty-five → 25, ten percent → 10%, five dollars → $5)\n3. Replace spoken punctuation with symbols (period → ., comma → ,, question mark → ?)\n4. Remove filler words (um, uh, like as filler)\n5. Keep the language in the original version (if it was french, keep it in french for example)\n\nPreserve exact meaning and word order. Do not paraphrase or reorder content.\n\nReturn only the cleaned transcript.\n\nTranscript:\n${output}".to_string(),
+        chord: None,
     }]
 }
 
@@ -673,6 +720,17 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
                         provider.supports_structured_output
                     );
                     existing.supports_structured_output = provider.supports_structured_output;
+                    changed = true;
+                }
+                // Sync auth_method from defaults for vendor-fixed providers.
+                // The custom provider is the only one whose auth_method is
+                // user-configurable (UI exposes it), so we never override it.
+                if provider.id != "custom" && existing.auth_method != provider.auth_method {
+                    debug!(
+                        "Updating auth_method for provider '{}' from {:?} to {:?}",
+                        provider.id, existing.auth_method, provider.auth_method
+                    );
+                    existing.auth_method = provider.auth_method;
                     changed = true;
                 }
             }
@@ -710,6 +768,44 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
     changed
 }
 
+/// Migrate the legacy `transcribe_with_post_process` model to the chord system.
+///
+/// Two changes:
+///   1. The user's previously selected post-process prompt
+///      (`post_process_selected_prompt_id`) is assigned a double-tap chord —
+///      preserving its behavior under the new model. After consuming it the
+///      field is cleared, which also serves as the migration's idempotency
+///      marker (re-running on already-migrated settings is a no-op).
+///   2. The legacy `transcribe_with_post_process` shortcut binding is dropped.
+///
+/// Returns `true` when settings were modified (caller should persist).
+fn migrate_chord_v1(settings: &mut AppSettings) -> bool {
+    let mut changed = false;
+
+    if let Some(prompt_id) = settings.post_process_selected_prompt_id.take() {
+        changed = true;
+        if let Some(prompt) = settings
+            .post_process_prompts
+            .iter_mut()
+            .find(|p| p.id == prompt_id)
+        {
+            if prompt.chord.is_none() {
+                prompt.chord = Some(PresetChord { tap_count: 2 });
+            }
+        }
+    }
+
+    if settings
+        .bindings
+        .remove("transcribe_with_post_process")
+        .is_some()
+    {
+        changed = true;
+    }
+
+    changed
+}
+
 pub const SETTINGS_STORE_PATH: &str = "settings_store.json";
 
 pub fn get_default_settings() -> AppSettings {
@@ -733,26 +829,10 @@ pub fn get_default_settings() -> AppSettings {
             current_binding: default_shortcut.to_string(),
         },
     );
-    #[cfg(target_os = "windows")]
-    let default_post_process_shortcut = "ctrl+shift+space";
-    #[cfg(target_os = "macos")]
-    let default_post_process_shortcut = "option+shift+space";
-    #[cfg(target_os = "linux")]
-    let default_post_process_shortcut = "ctrl+shift+space";
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    let default_post_process_shortcut = "alt+shift+space";
-
-    bindings.insert(
-        "transcribe_with_post_process".to_string(),
-        ShortcutBinding {
-            id: "transcribe_with_post_process".to_string(),
-            name: "Transcribe with Post-Processing".to_string(),
-            description: "Converts your speech into text and applies AI post-processing."
-                .to_string(),
-            default_binding: default_post_process_shortcut.to_string(),
-            current_binding: default_post_process_shortcut.to_string(),
-        },
-    );
+    // The legacy `transcribe_with_post_process` binding has been removed —
+    // post-processing is now reached by tap-count chord on the regular
+    // `transcribe` shortcut (e.g. double-tap → run the chord-bound preset).
+    // `migrate_chord_v1` drops the binding from existing user settings on load.
     bindings.insert(
         "cancel".to_string(),
         ShortcutBinding {
@@ -838,6 +918,37 @@ impl AppSettings {
             .iter_mut()
             .find(|provider| provider.id == provider_id)
     }
+
+    /// Resolve a tap-count to the prompt id it should invoke.
+    ///
+    /// `count == 0` and `count == 1` always return `None` (plain transcription;
+    /// no LLM post-processing). For `count >= 2`, returns the id of the first
+    /// prompt whose `chord.tap_count` matches.
+    pub fn preset_id_for_chord_count(&self, count: u32) -> Option<String> {
+        if count < 2 {
+            return None;
+        }
+        self.post_process_prompts
+            .iter()
+            .find(|p| p.chord.as_ref().map(|c| c.tap_count) == Some(count))
+            .map(|p| p.id.clone())
+    }
+
+    /// Check whether assigning `count` to the prompt with `id` would collide
+    /// with another prompt's existing chord. Returns the id of the conflicting
+    /// prompt (or `None` if no conflict).
+    ///
+    /// Counts below 2 are treated as "no chord requested" and never conflict.
+    /// A prompt does not conflict with itself.
+    pub fn chord_conflict(&self, id: &str, count: u32) -> Option<String> {
+        if count < 2 {
+            return None;
+        }
+        self.post_process_prompts
+            .iter()
+            .find(|p| p.id != id && p.chord.as_ref().map(|c| c.tap_count) == Some(count))
+            .map(|p| p.id.clone())
+    }
 }
 
 pub fn load_or_create_app_settings(app: &AppHandle) -> AppSettings {
@@ -850,7 +961,16 @@ pub fn load_or_create_app_settings(app: &AppHandle) -> AppSettings {
         // Parse the entire settings object
         match serde_json::from_value::<AppSettings>(settings_value) {
             Ok(mut settings) => {
-                debug!("Found existing settings: {:?}", settings);
+                // Avoid logging the full struct — its `Debug` impl redacts
+                // API keys today, but logging a summary instead removes the
+                // ongoing dependency on that redaction holding as the
+                // codebase evolves.
+                debug!(
+                    "Loaded existing settings: {} bindings, {} providers, {} prompts",
+                    settings.bindings.len(),
+                    settings.post_process_providers.len(),
+                    settings.post_process_prompts.len(),
+                );
                 let default_settings = get_default_settings();
                 let mut updated = false;
 
@@ -884,7 +1004,9 @@ pub fn load_or_create_app_settings(app: &AppHandle) -> AppSettings {
         default_settings
     };
 
-    if ensure_post_process_defaults(&mut settings) {
+    let mut changed = ensure_post_process_defaults(&mut settings);
+    changed |= migrate_chord_v1(&mut settings);
+    if changed {
         store.set("settings", serde_json::to_value(&settings).unwrap());
     }
 
@@ -908,7 +1030,9 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
         default_settings
     };
 
-    if ensure_post_process_defaults(&mut settings) {
+    let mut changed = ensure_post_process_defaults(&mut settings);
+    changed |= migrate_chord_v1(&mut settings);
+    if changed {
         store.set("settings", serde_json::to_value(&settings).unwrap());
     }
 
@@ -985,5 +1109,383 @@ mod tests {
         let out = format!("{:?}", map);
         assert!(!out.contains("secret"));
         assert!(out.contains("[REDACTED]"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Chord-system migration tests (Phase 1 of chord-system.md).
+    //
+    // The migration replaces the legacy "transcribe_with_post_process"
+    // binding model with per-prompt tap-count chords. On upgrade:
+    //   - The user's previously selected post-process prompt gets
+    //     `chord = Some(PresetChord { tap_count: 2 })`.
+    //   - `post_process_selected_prompt_id` is cleared (its job is now
+    //     done by the chord on the prompt itself).
+    //   - The legacy binding is dropped from `settings.bindings`.
+    // ---------------------------------------------------------------------
+
+    fn prompt(id: &str, chord: Option<PresetChord>) -> LLMPrompt {
+        LLMPrompt {
+            id: id.to_string(),
+            name: format!("Prompt {id}"),
+            prompt: "test".to_string(),
+            chord,
+        }
+    }
+
+    #[test]
+    fn chord_migration_assigns_double_tap_to_selected_prompt() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![prompt("p1", None)];
+        settings.post_process_selected_prompt_id = Some("p1".to_string());
+
+        let changed = migrate_chord_v1(&mut settings);
+
+        assert!(changed, "first run should report a change");
+        assert_eq!(
+            settings.post_process_prompts[0].chord,
+            Some(PresetChord { tap_count: 2 }),
+            "selected prompt should be assigned double-tap chord"
+        );
+    }
+
+    #[test]
+    fn chord_migration_drops_legacy_post_process_binding() {
+        let mut settings = get_default_settings();
+        // Defaults no longer contain the legacy binding (the chord system
+        // replaced it). Re-insert it as if loaded from a pre-migration store
+        // so we can verify the migration removes it.
+        settings.bindings.insert(
+            "transcribe_with_post_process".to_string(),
+            ShortcutBinding {
+                id: "transcribe_with_post_process".to_string(),
+                name: "Legacy".into(),
+                description: "Legacy".into(),
+                default_binding: "ctrl+shift+space".into(),
+                current_binding: "ctrl+shift+space".into(),
+            },
+        );
+
+        migrate_chord_v1(&mut settings);
+
+        assert!(
+            !settings
+                .bindings
+                .contains_key("transcribe_with_post_process"),
+            "legacy binding should be removed by migration"
+        );
+        assert!(
+            settings.bindings.contains_key("transcribe"),
+            "primary transcribe binding must be preserved"
+        );
+    }
+
+    #[test]
+    fn default_settings_have_no_legacy_post_process_binding() {
+        let settings = get_default_settings();
+        assert!(
+            !settings
+                .bindings
+                .contains_key("transcribe_with_post_process"),
+            "legacy binding must not appear in defaults — chord-system replaces it"
+        );
+        assert!(settings.bindings.contains_key("transcribe"));
+        assert!(settings.bindings.contains_key("cancel"));
+    }
+
+    #[test]
+    fn chord_migration_clears_selected_prompt_id() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![prompt("p1", None)];
+        settings.post_process_selected_prompt_id = Some("p1".to_string());
+
+        migrate_chord_v1(&mut settings);
+
+        assert_eq!(
+            settings.post_process_selected_prompt_id, None,
+            "selected_prompt_id is the migration's signal; it should be cleared after"
+        );
+    }
+
+    #[test]
+    fn chord_migration_is_idempotent() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![prompt("p1", None)];
+        settings.post_process_selected_prompt_id = Some("p1".to_string());
+
+        let first = migrate_chord_v1(&mut settings);
+        let snapshot_chord = settings.post_process_prompts[0].chord.clone();
+        let snapshot_selected = settings.post_process_selected_prompt_id.clone();
+        let snapshot_has_legacy = settings
+            .bindings
+            .contains_key("transcribe_with_post_process");
+
+        let second = migrate_chord_v1(&mut settings);
+
+        assert!(first, "first run reports change");
+        assert!(!second, "second run is a no-op");
+        assert_eq!(snapshot_chord, settings.post_process_prompts[0].chord);
+        assert_eq!(snapshot_selected, settings.post_process_selected_prompt_id);
+        assert_eq!(
+            snapshot_has_legacy,
+            settings
+                .bindings
+                .contains_key("transcribe_with_post_process")
+        );
+    }
+
+    #[test]
+    fn chord_migration_preserves_existing_chord() {
+        let mut settings = get_default_settings();
+        let existing = PresetChord { tap_count: 5 };
+        settings.post_process_prompts = vec![prompt("p1", Some(existing.clone()))];
+        settings.post_process_selected_prompt_id = Some("p1".to_string());
+
+        migrate_chord_v1(&mut settings);
+
+        assert_eq!(
+            settings.post_process_prompts[0].chord,
+            Some(existing),
+            "migration must not overwrite a chord the user (or a prior migration) already set"
+        );
+    }
+
+    #[test]
+    fn chord_migration_handles_unknown_selected_prompt_id() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![]; // selected_prompt_id refers to nothing
+        settings.post_process_selected_prompt_id = Some("does_not_exist".to_string());
+
+        // Must not panic, must still consume the orphan selected_prompt_id.
+        let changed = migrate_chord_v1(&mut settings);
+
+        assert!(changed);
+        assert_eq!(settings.post_process_selected_prompt_id, None);
+    }
+
+    #[test]
+    fn chord_migration_no_op_when_already_clean() {
+        let mut settings = get_default_settings();
+        settings.post_process_selected_prompt_id = None;
+        settings.bindings.remove("transcribe_with_post_process");
+
+        let changed = migrate_chord_v1(&mut settings);
+
+        assert!(!changed, "nothing to migrate ⇒ no change reported");
+    }
+
+    #[test]
+    fn llm_prompt_default_has_no_chord() {
+        let prompts = default_post_process_prompts();
+        assert!(
+            !prompts.is_empty(),
+            "default prompts list must be populated"
+        );
+        assert!(
+            prompts.iter().all(|p| p.chord.is_none()),
+            "default prompts ship with no chord assigned"
+        );
+    }
+
+    // ---- preset_id_for_chord_count ----------------------------------------
+
+    #[test]
+    fn preset_lookup_returns_none_for_count_below_2() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![prompt("p1", Some(PresetChord { tap_count: 1 }))]; // tap_count:1 is malformed but defensively shouldn't be returned
+        assert_eq!(settings.preset_id_for_chord_count(0), None);
+        assert_eq!(settings.preset_id_for_chord_count(1), None);
+    }
+
+    #[test]
+    fn preset_lookup_finds_matching_chord() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![
+            prompt("p1", Some(PresetChord { tap_count: 2 })),
+            prompt("p2", Some(PresetChord { tap_count: 3 })),
+            prompt("p3", None),
+        ];
+        assert_eq!(
+            settings.preset_id_for_chord_count(2),
+            Some("p1".to_string())
+        );
+        assert_eq!(
+            settings.preset_id_for_chord_count(3),
+            Some("p2".to_string())
+        );
+    }
+
+    #[test]
+    fn preset_lookup_returns_none_for_unconfigured_count() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![prompt("p1", Some(PresetChord { tap_count: 2 }))];
+        assert_eq!(settings.preset_id_for_chord_count(4), None);
+    }
+
+    #[test]
+    fn preset_lookup_returns_first_match_when_two_prompts_collide() {
+        // Settings UI is supposed to prevent this, but defend against bad state.
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![
+            prompt("p_first", Some(PresetChord { tap_count: 2 })),
+            prompt("p_second", Some(PresetChord { tap_count: 2 })),
+        ];
+        assert_eq!(
+            settings.preset_id_for_chord_count(2),
+            Some("p_first".to_string())
+        );
+    }
+
+    // ---- chord_conflict ----------------------------------------------------
+
+    #[test]
+    fn chord_conflict_returns_none_when_no_other_prompt_has_count() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![
+            prompt("p1", Some(PresetChord { tap_count: 2 })),
+            prompt("p2", None),
+        ];
+        // Asking for count=3 — nobody owns it.
+        assert_eq!(settings.chord_conflict("p1", 3), None);
+    }
+
+    #[test]
+    fn chord_conflict_finds_existing_owner() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![
+            prompt("p1", Some(PresetChord { tap_count: 2 })),
+            prompt("p2", None),
+        ];
+        // p2 wants count=2 which p1 already owns.
+        assert_eq!(settings.chord_conflict("p2", 2), Some("p1".to_string()));
+    }
+
+    #[test]
+    fn chord_conflict_ignores_self() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![prompt("p1", Some(PresetChord { tap_count: 2 }))];
+        // p1 setting itself to its own current count is not a conflict.
+        assert_eq!(settings.chord_conflict("p1", 2), None);
+    }
+
+    // ---- AuthMethod / provider defaults -------------------------------------
+
+    #[test]
+    fn default_anthropic_provider_uses_x_api_key() {
+        let providers = default_post_process_providers();
+        let anthropic = providers
+            .iter()
+            .find(|p| p.id == "anthropic")
+            .expect("anthropic provider in defaults");
+        assert_eq!(anthropic.auth_method, AuthMethod::XApiKey);
+    }
+
+    #[test]
+    fn default_openai_provider_uses_bearer_token() {
+        let providers = default_post_process_providers();
+        let openai = providers
+            .iter()
+            .find(|p| p.id == "openai")
+            .expect("openai provider in defaults");
+        assert_eq!(openai.auth_method, AuthMethod::BearerToken);
+    }
+
+    #[test]
+    fn default_custom_provider_uses_bearer_token() {
+        let providers = default_post_process_providers();
+        let custom = providers
+            .iter()
+            .find(|p| p.id == "custom")
+            .expect("custom provider in defaults");
+        assert_eq!(custom.auth_method, AuthMethod::BearerToken);
+    }
+
+    #[test]
+    fn ensure_defaults_patches_legacy_anthropic_to_x_api_key() {
+        // Existing user upgraded from a build where auth_method didn't exist —
+        // anthropic deserialized with serde-default BearerToken, which is wrong.
+        // ensure_post_process_defaults must correct it.
+        let mut settings = get_default_settings();
+        let anthropic = settings.post_process_provider_mut("anthropic").unwrap();
+        anthropic.auth_method = AuthMethod::BearerToken;
+
+        let changed = ensure_post_process_defaults(&mut settings);
+
+        assert!(changed, "should report change when patching anthropic");
+        assert_eq!(
+            settings
+                .post_process_provider("anthropic")
+                .unwrap()
+                .auth_method,
+            AuthMethod::XApiKey,
+        );
+    }
+
+    #[test]
+    fn ensure_defaults_preserves_user_choice_on_custom_provider() {
+        // The custom provider is the only one whose auth_method is user-
+        // configurable via UI. ensure_post_process_defaults must not stomp
+        // on whatever the user picked there.
+        let mut settings = get_default_settings();
+        let custom = settings.post_process_provider_mut("custom").unwrap();
+        custom.auth_method = AuthMethod::XApiKey;
+
+        ensure_post_process_defaults(&mut settings);
+
+        assert_eq!(
+            settings
+                .post_process_provider("custom")
+                .unwrap()
+                .auth_method,
+            AuthMethod::XApiKey,
+            "user's custom auth choice must survive settings load"
+        );
+    }
+
+    #[test]
+    fn provider_deserializes_legacy_json_without_auth_method() {
+        let json = r#"{
+            "id": "openai",
+            "label": "OpenAI",
+            "base_url": "https://api.openai.com/v1"
+        }"#;
+        let p: PostProcessProvider = serde_json::from_str(json).expect("legacy compat");
+        // serde default = BearerToken; ensure_post_process_defaults will correct
+        // anthropic but openai is fine.
+        assert_eq!(p.auth_method, AuthMethod::BearerToken);
+    }
+
+    #[test]
+    fn chord_conflict_count_below_2_is_never_a_conflict() {
+        // count < 2 means "plain" / "unbound" — we should not detect conflicts
+        // even if a malformed prior config has another prompt with tap_count: 0/1.
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![prompt("p1", Some(PresetChord { tap_count: 1 }))];
+        assert_eq!(settings.chord_conflict("p2", 0), None);
+        assert_eq!(settings.chord_conflict("p2", 1), None);
+    }
+
+    #[test]
+    fn preset_lookup_skips_prompts_without_chord() {
+        let mut settings = get_default_settings();
+        settings.post_process_prompts = vec![
+            prompt("nochord", None),
+            prompt("withchord", Some(PresetChord { tap_count: 2 })),
+        ];
+        assert_eq!(
+            settings.preset_id_for_chord_count(2),
+            Some("withchord".to_string())
+        );
+    }
+
+    #[test]
+    fn llm_prompt_deserializes_old_json_without_chord_field() {
+        // Settings persisted before this migration won't contain a `chord` key.
+        let json = r#"{
+            "id": "x",
+            "name": "X",
+            "prompt": "p"
+        }"#;
+        let p: LLMPrompt = serde_json::from_str(json).expect("backwards-compat deserialize");
+        assert_eq!(p.chord, None);
     }
 }

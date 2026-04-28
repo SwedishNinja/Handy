@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io::Error,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -351,7 +352,104 @@ pub fn is_no_input_device_error(error_message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_microphone_access_denied, is_no_input_device_error};
+    use super::{is_microphone_access_denied, is_no_input_device_error, PreRollBuffer};
+
+    // ---- PreRollBuffer (chord-system pre-roll ring buffer) ------------------
+    //
+    // The buffer accumulates audio that arrived BEFORE recording was committed
+    // (during the chord window) and gets spliced into the recording at start
+    // time, compensating for the chord-window latency. It must keep only the
+    // most recent `target` samples regardless of how much is pushed.
+    //
+    // See `.planning/chord-system.md` (Phase 3) for the design.
+
+    #[test]
+    fn preroll_new_buffer_is_empty() {
+        let buf = PreRollBuffer::new(100);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn preroll_push_below_target_retains_all() {
+        let mut buf = PreRollBuffer::new(100);
+        buf.push(&[1.0_f32, 2.0, 3.0]);
+        assert_eq!(buf.len(), 3);
+    }
+
+    #[test]
+    fn preroll_push_at_target_retains_all() {
+        let mut buf = PreRollBuffer::new(3);
+        buf.push(&[1.0_f32, 2.0, 3.0]);
+        assert_eq!(buf.len(), 3);
+    }
+
+    #[test]
+    fn preroll_push_over_target_keeps_only_most_recent() {
+        let mut buf = PreRollBuffer::new(3);
+        buf.push(&[1.0_f32, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(buf.len(), 3);
+
+        let mut drained = Vec::new();
+        buf.drain_into(&mut drained);
+        assert_eq!(drained, vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn preroll_accumulating_pushes_are_bounded_to_target() {
+        // Push 1000 samples in 100-sample chunks — buffer must cap at target.
+        let mut buf = PreRollBuffer::new(50);
+        for chunk_start in 0..10 {
+            let chunk: Vec<f32> = (0..100).map(|i| (chunk_start * 100 + i) as f32).collect();
+            buf.push(&chunk);
+        }
+        assert_eq!(buf.len(), 50, "buffer must stay bounded to target");
+
+        let mut drained = Vec::new();
+        buf.drain_into(&mut drained);
+        // Last 50 samples were values 950..1000.
+        let expected: Vec<f32> = (950..1000).map(|i| i as f32).collect();
+        assert_eq!(drained, expected);
+    }
+
+    #[test]
+    fn preroll_drain_into_empties_buffer() {
+        let mut buf = PreRollBuffer::new(10);
+        buf.push(&[1.0_f32, 2.0, 3.0]);
+
+        let mut out = vec![99.0_f32]; // ensure drain APPENDS, not replaces
+        buf.drain_into(&mut out);
+
+        assert_eq!(out, vec![99.0, 1.0, 2.0, 3.0]);
+        assert_eq!(buf.len(), 0, "buffer empty after drain");
+    }
+
+    #[test]
+    fn preroll_push_after_drain_works() {
+        let mut buf = PreRollBuffer::new(3);
+        buf.push(&[1.0_f32, 2.0]);
+        let mut tmp = Vec::new();
+        buf.drain_into(&mut tmp);
+
+        // Reuse buffer for next chord.
+        buf.push(&[10.0_f32, 20.0, 30.0, 40.0]);
+        let mut second = Vec::new();
+        buf.drain_into(&mut second);
+        assert_eq!(second, vec![20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn preroll_zero_target_keeps_nothing() {
+        // Pre-roll disabled (target=0). Pushes are no-ops; drain is empty.
+        let mut buf = PreRollBuffer::new(0);
+        buf.push(&[1.0_f32, 2.0, 3.0]);
+        assert_eq!(buf.len(), 0);
+
+        let mut out = Vec::new();
+        buf.drain_into(&mut out);
+        assert!(out.is_empty());
+    }
+
+    // ---- existing error-string detection tests ------------------------------
 
     #[test]
     fn detects_access_is_denied() {
@@ -392,6 +490,60 @@ mod tests {
     }
 }
 
+/// Bounded ring buffer of recent audio samples that arrived BEFORE recording
+/// was committed. Used by [`run_consumer`] to splice the chord-window's audio
+/// into the start of a recording so the user doesn't lose the leading ~200ms
+/// of speech to the chord-window latency.
+///
+/// `target` is the desired retention size in samples (typically
+/// `WHISPER_SAMPLE_RATE * PREROLL_MS / 1000`). After every push the buffer is
+/// truncated from the front so it never exceeds `target`. Memory is small —
+/// 300ms at 16kHz is ~10KB.
+///
+/// Pre-roll bypasses VAD by design — VAD is for trimming silence within a
+/// recording, not for pre-deciding what to capture.
+struct PreRollBuffer {
+    buf: VecDeque<f32>,
+    target: usize,
+}
+
+impl PreRollBuffer {
+    fn new(target: usize) -> Self {
+        Self {
+            buf: VecDeque::with_capacity(target),
+            target,
+        }
+    }
+
+    fn push(&mut self, samples: &[f32]) {
+        if self.target == 0 {
+            return;
+        }
+        self.buf.extend(samples);
+        let len = self.buf.len();
+        if len > self.target {
+            self.buf.drain(..len - self.target);
+        }
+    }
+
+    fn drain_into(&mut self, out: &mut Vec<f32>) {
+        out.extend(self.buf.drain(..));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+/// Pre-roll retention window — captures audio that arrived during the
+/// chord-system's tap-counting window so a recording started after the
+/// window closes still includes the user's first words.
+///
+/// Stored at the post-resample (16kHz) sample rate, so 300ms ≈ 4800 samples
+/// (~19KB). Tunable; see `.planning/chord-system.md` open question (2).
+const PREROLL_MS: u32 = 300;
+
 fn run_consumer(
     in_sample_rate: u32,
     vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
@@ -406,6 +558,8 @@ fn run_consumer(
         Duration::from_millis(30),
     );
 
+    let preroll_target = (constants::WHISPER_SAMPLE_RATE * PREROLL_MS / 1000) as usize;
+    let mut preroll = PreRollBuffer::new(preroll_target);
     let mut processed_samples = Vec::<f32>::new();
     let mut recording = false;
 
@@ -425,8 +579,13 @@ fn run_consumer(
         recording: bool,
         vad: &Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
         out_buf: &mut Vec<f32>,
+        preroll: &mut PreRollBuffer,
     ) {
         if !recording {
+            // Stash recent audio so the chord-system can splice the
+            // pre-recording window into the start of the eventual recording.
+            // VAD is intentionally not applied here — see PreRollBuffer docs.
+            preroll.push(samples);
             return;
         }
 
@@ -461,7 +620,7 @@ fn run_consumer(
 
         // ---------- existing pipeline ------------------------------------ //
         frame_resampler.push(&raw, &mut |frame: &[f32]| {
-            handle_frame(frame, recording, &vad, &mut processed_samples)
+            handle_frame(frame, recording, &vad, &mut processed_samples, &mut preroll)
         });
 
         // non-blocking check for a command
@@ -470,6 +629,10 @@ fn run_consumer(
                 Cmd::Start => {
                     stop_flag.store(false, Ordering::Relaxed);
                     processed_samples.clear();
+                    // Splice the chord-window's audio into the start of the
+                    // recording so the user's first words aren't lost to the
+                    // 200ms chord-resolve latency.
+                    preroll.drain_into(&mut processed_samples);
                     recording = true;
                     visualizer.reset();
                     if let Some(v) = &vad {
@@ -488,7 +651,13 @@ fn run_consumer(
                         match sample_rx.recv_timeout(Duration::from_secs(2)) {
                             Ok(AudioChunk::Samples(remaining)) => {
                                 frame_resampler.push(&remaining, &mut |frame: &[f32]| {
-                                    handle_frame(frame, true, &vad, &mut processed_samples)
+                                    handle_frame(
+                                        frame,
+                                        true,
+                                        &vad,
+                                        &mut processed_samples,
+                                        &mut preroll,
+                                    )
                                 });
                             }
                             Ok(AudioChunk::EndOfStream) => break,
@@ -500,7 +669,7 @@ fn run_consumer(
                     }
 
                     frame_resampler.finish(&mut |frame: &[f32]| {
-                        handle_frame(frame, true, &vad, &mut processed_samples)
+                        handle_frame(frame, true, &vad, &mut processed_samples, &mut preroll)
                     });
 
                     let _ = reply_tx.send(std::mem::take(&mut processed_samples));
