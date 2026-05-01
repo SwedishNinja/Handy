@@ -20,10 +20,16 @@ pub fn cancel_current_operation(app: &AppHandle) {
     // Unregister the cancel shortcut asynchronously
     shortcut::unregister_cancel_shortcut(app);
 
-    // Cancel any ongoing recording
+    // Cancel any ongoing recording (drops the pipeline sender → EOF signal)
     let audio_manager = app.state::<Arc<AudioRecordingManager>>();
     let recording_was_active = audio_manager.is_recording();
     audio_manager.cancel_recording();
+
+    // Discard any streaming pipeline handle — the pipeline thread will have
+    // received EOF and exited, but we don't collect its results.
+    if let Some(state) = app.try_state::<crate::streaming::StreamingState>() {
+        state.take();
+    }
 
     // Update tray icon and hide overlay
     change_tray_icon(app, crate::tray::TrayIconState::Idle);

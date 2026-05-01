@@ -437,46 +437,40 @@ impl TranscriptionManager {
         current_model.clone()
     }
 
-    pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
-        #[cfg(debug_assertions)]
-        if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
-            return Err(anyhow::anyhow!(
-                "Simulated transcription failure (HANDY_FORCE_TRANSCRIPTION_FAILURE)"
-            ));
-        }
-
-        // Update last activity timestamp
+    /// Call the loaded speech model on `audio` and return raw text.
+    ///
+    /// `whisper_context` is used as Whisper's `initial_prompt` when provided,
+    /// giving the model conversational context from the previous chunk. When
+    /// `None`, custom words (if any) are used as the prompt instead. Non-Whisper
+    /// engines ignore this parameter.
+    ///
+    /// This method does **not** apply post-processing (custom-word correction,
+    /// filler filtering). Callers that need a single-chunk result should call
+    /// [`transcribe`] instead; [`transcribe_chunks`] uses this to accumulate
+    /// chunk texts before applying post-processing to the joined result.
+    fn transcribe_engine(&self, audio: Vec<f32>, whisper_context: Option<&str>) -> Result<String> {
         self.touch_activity();
 
-        let st = std::time::Instant::now();
-
-        debug!("Audio vector length: {}", audio.len());
-
         if audio.is_empty() {
-            debug!("Empty audio vector");
             self.maybe_unload_immediately("empty audio");
             return Ok(String::new());
         }
 
-        // Check if model is loaded, if not try to load it
+        // Wait for any in-progress model load to finish.
         {
-            // If the model is loading, wait for it to complete.
             let mut is_loading = self.is_loading.lock().unwrap();
             while *is_loading {
                 is_loading = self.loading_condvar.wait(is_loading).unwrap();
             }
-
             let engine_guard = self.lock_engine();
             if engine_guard.is_none() {
                 return Err(anyhow::anyhow!("Model is not loaded for transcription."));
             }
         }
 
-        // Get current settings for configuration
         let settings = get_settings(&self.app_handle);
 
         // Validate selected language against the model's supported languages.
-        // If the language isn't supported, fall back to "auto" to prevent errors.
         let validated_language = if settings.selected_language == "auto" {
             "auto".to_string()
         } else {
@@ -502,26 +496,19 @@ impl TranscriptionManager {
             }
         };
 
-        // Perform transcription with the appropriate engine.
-        // We use catch_unwind to prevent engine panics from poisoning the mutex,
-        // which would make the app hang indefinitely on subsequent operations.
+        // Run the engine. We use catch_unwind so a panicking engine doesn't
+        // poison the mutex and hang the app on subsequent calls.
         let result = {
             let mut engine_guard = self.lock_engine();
-
-            // Take the engine out so we own it during transcription.
-            // If the engine panics, we simply don't put it back (effectively unloading it)
-            // instead of poisoning the mutex.
             let mut engine = match engine_guard.take() {
                 Some(e) => e,
                 None => {
                     return Err(anyhow::anyhow!(
-                        "Model failed to load after auto-load attempt. Please check your model settings."
+                        "Model failed to load. Please check your model settings."
                     ));
                 }
             };
-
-            // Release the lock before transcribing — no mutex held during the engine call
-            drop(engine_guard);
+            drop(engine_guard); // release lock before the blocking call
 
             let transcribe_result = catch_unwind(AssertUnwindSafe(
                 || -> Result<transcribe_rs::TranscriptionResult> {
@@ -540,14 +527,21 @@ impl TranscriptionManager {
                                 Some(normalized)
                             };
 
+                            // Use explicit context (chunk carry-forward) when provided;
+                            // otherwise fall back to custom words as prompt.
+                            let initial_prompt =
+                                whisper_context.map(|ctx| ctx.to_string()).or_else(|| {
+                                    if settings.custom_words.is_empty() {
+                                        None
+                                    } else {
+                                        Some(settings.custom_words.join(", "))
+                                    }
+                                });
+
                             let params = WhisperInferenceParams {
                                 language: whisper_language,
                                 translate: settings.translate_to_english,
-                                initial_prompt: if settings.custom_words.is_empty() {
-                                    None
-                                } else {
-                                    Some(settings.custom_words.join(", "))
-                                },
+                                initial_prompt,
                                 ..Default::default()
                             };
 
@@ -635,14 +629,11 @@ impl TranscriptionManager {
 
             match transcribe_result {
                 Ok(inner_result) => {
-                    // Success or normal error — put the engine back
                     let mut engine_guard = self.lock_engine();
                     *engine_guard = Some(engine);
                     inner_result?
                 }
                 Err(panic_payload) => {
-                    // Engine panicked — do NOT put it back (it's in an unknown state).
-                    // The engine is dropped here, effectively unloading it.
                     let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
                         s.to_string()
                     } else if let Some(s) = panic_payload.downcast_ref::<String>() {
@@ -654,8 +645,6 @@ impl TranscriptionManager {
                         "Transcription engine panicked: {}. Model has been unloaded.",
                         panic_msg
                     );
-
-                    // Clear the model ID so it will be reloaded on next attempt
                     {
                         let mut current_model = self
                             .current_model_id
@@ -663,7 +652,6 @@ impl TranscriptionManager {
                             .unwrap_or_else(|e| e.into_inner());
                         *current_model = None;
                     }
-
                     let _ = self.app_handle.emit(
                         "model-state-changed",
                         ModelStateEvent {
@@ -673,7 +661,6 @@ impl TranscriptionManager {
                             error: Some(format!("Engine panicked: {}", panic_msg)),
                         },
                     );
-
                     return Err(anyhow::anyhow!(
                         "Transcription engine panicked: {}. The model has been unloaded and will reload on next attempt.",
                         panic_msg
@@ -682,27 +669,42 @@ impl TranscriptionManager {
             }
         };
 
-        // Apply word correction if custom words are configured.
-        // Skip for Whisper models since custom words are already passed as initial_prompt.
+        Ok(result.text)
+    }
+
+    pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        #[cfg(debug_assertions)]
+        if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
+            return Err(anyhow::anyhow!(
+                "Simulated transcription failure (HANDY_FORCE_TRANSCRIPTION_FAILURE)"
+            ));
+        }
+
+        let st = std::time::Instant::now();
+        debug!("Audio vector length: {}", audio.len());
+
+        let raw_text = self.transcribe_engine(audio, None)?;
+
+        let settings = get_settings(&self.app_handle);
+
         let is_whisper = self
             .model_manager
             .get_model_info(&settings.selected_model)
             .map(|info| matches!(info.engine_type, EngineType::Whisper))
             .unwrap_or(false);
 
-        let corrected_result = if !settings.custom_words.is_empty() && !is_whisper {
+        let corrected = if !settings.custom_words.is_empty() && !is_whisper {
             apply_custom_words(
-                &result.text,
+                &raw_text,
                 &settings.custom_words,
                 settings.word_correction_threshold,
             )
         } else {
-            result.text
+            raw_text
         };
 
-        // Filter out filler words and hallucinations
-        let filtered_result = filter_transcription_output(
-            &corrected_result,
+        let filtered = filter_transcription_output(
+            &corrected,
             &settings.app_language,
             &settings.custom_filler_words,
         );
@@ -719,18 +721,249 @@ impl TranscriptionManager {
             translation_note
         );
 
-        let final_result = filtered_result;
-
-        if final_result.is_empty() {
+        if filtered.is_empty() {
             info!("Transcription result is empty");
         } else {
-            info!("Transcription result: {}", final_result);
+            info!("Transcription result: {}", filtered);
         }
 
         self.maybe_unload_immediately("transcription");
-
-        Ok(final_result)
+        Ok(filtered)
     }
+
+    /// Transcribe audio that has been split into sequential chunks.
+    ///
+    /// For a single chunk this delegates to [`transcribe`]. For multiple chunks
+    /// each is transcribed in order; Whisper receives the tail of the previous
+    /// chunk's text as `initial_prompt` so it treats the audio as a continuation
+    /// rather than a fresh utterance — preventing unwanted sentence-ending
+    /// punctuation at chunk boundaries. Non-Whisper engines use a simple
+    /// heuristic join (strip trailing period, lowercase first char of next chunk).
+    ///
+    /// Post-processing (custom-word correction, filler filtering) is applied once
+    /// to the joined result, not per chunk.
+    pub fn transcribe_chunks(&self, chunks: Vec<Vec<f32>>) -> Result<String> {
+        #[cfg(debug_assertions)]
+        if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
+            return Err(anyhow::anyhow!(
+                "Simulated transcription failure (HANDY_FORCE_TRANSCRIPTION_FAILURE)"
+            ));
+        }
+
+        if chunks.len() <= 1 {
+            return self.transcribe(chunks.into_iter().next().unwrap_or_default());
+        }
+
+        let st = std::time::Instant::now();
+        let settings = get_settings(&self.app_handle);
+
+        let is_whisper = self
+            .model_manager
+            .get_model_info(&settings.selected_model)
+            .map(|info| matches!(info.engine_type, EngineType::Whisper))
+            .unwrap_or(false);
+
+        let mut chunk_texts: Vec<String> = Vec::with_capacity(chunks.len());
+        let mut whisper_context: Option<String> = None;
+
+        for chunk in chunks {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let ctx = if is_whisper {
+                whisper_context.as_deref()
+            } else {
+                None
+            };
+            let text = self.transcribe_engine(chunk, ctx)?;
+
+            if is_whisper {
+                // Carry the tail of this chunk's text as context into the next call.
+                let tail_start = text.len().saturating_sub(200);
+                whisper_context = Some(text[tail_start..].to_string());
+            }
+
+            chunk_texts.push(text);
+        }
+
+        if chunk_texts.is_empty() {
+            self.maybe_unload_immediately("transcription");
+            return Ok(String::new());
+        }
+
+        let joined = if is_whisper {
+            // With initial_prompt carry-forward Whisper produces natural continuations,
+            // so a plain space join is sufficient.
+            chunk_texts.join(" ")
+        } else {
+            join_chunks_heuristic(&chunk_texts)
+        };
+
+        // Post-process the joined result (not per-chunk).
+        let corrected = if !settings.custom_words.is_empty() && !is_whisper {
+            apply_custom_words(
+                &joined,
+                &settings.custom_words,
+                settings.word_correction_threshold,
+            )
+        } else {
+            joined
+        };
+
+        let filtered = filter_transcription_output(
+            &corrected,
+            &settings.app_language,
+            &settings.custom_filler_words,
+        );
+
+        let et = std::time::Instant::now();
+        let translation_note = if settings.translate_to_english {
+            " (translated)"
+        } else {
+            ""
+        };
+        info!(
+            "Chunked transcription ({} chunks) completed in {}ms{}",
+            chunk_texts.len(),
+            (et - st).as_millis(),
+            translation_note
+        );
+
+        if filtered.is_empty() {
+            info!("Chunked transcription result is empty");
+        } else {
+            info!("Chunked transcription result: {}", filtered);
+        }
+
+        self.maybe_unload_immediately("transcription");
+        Ok(filtered)
+    }
+
+    /// Returns `true` when the currently selected model is a Whisper engine.
+    /// Used by the streaming pipeline to choose the right join strategy.
+    pub fn is_whisper_engine(&self) -> bool {
+        let settings = get_settings(&self.app_handle);
+        self.model_manager
+            .get_model_info(&settings.selected_model)
+            .map(|info| matches!(info.engine_type, EngineType::Whisper))
+            .unwrap_or(false)
+    }
+
+    /// Receive audio chunks from `chunk_rx` and transcribe them sequentially,
+    /// carrying Whisper context forward between chunks. Blocks until the sender
+    /// is dropped (i.e. recording has stopped and the final chunk was sent).
+    ///
+    /// Returns the raw (pre-post-processing) text for each chunk in order.
+    /// The caller is responsible for joining and applying post-processing via
+    /// [`apply_postprocess_to_chunks`].
+    pub fn run_streaming_pipeline(
+        &self,
+        chunk_rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    ) -> anyhow::Result<Vec<String>> {
+        let is_whisper = self.is_whisper_engine();
+        let mut chunk_texts: Vec<String> = Vec::new();
+        let mut whisper_context: Option<String> = None;
+
+        while let Ok(chunk) = chunk_rx.recv() {
+            if chunk.is_empty() {
+                continue;
+            }
+            let ctx = if is_whisper {
+                whisper_context.as_deref()
+            } else {
+                None
+            };
+            let text = self.transcribe_engine(chunk, ctx)?;
+            if is_whisper {
+                let tail_start = text.len().saturating_sub(200);
+                whisper_context = Some(text[tail_start..].to_string());
+            }
+            info!(
+                "Streaming pipeline: transcribed chunk {} ({} chars)",
+                chunk_texts.len() + 1,
+                text.len()
+            );
+            chunk_texts.push(text);
+        }
+
+        // All chunks processed — unload now if model_unload_timeout = Immediately.
+        // Must not be called between chunks (that would drop the model mid-session).
+        self.maybe_unload_immediately("streaming transcription");
+
+        Ok(chunk_texts)
+    }
+
+    /// Join raw chunk texts produced by [`run_streaming_pipeline`] and apply
+    /// post-processing (custom-word correction, filler filtering) to the
+    /// combined result.
+    pub fn apply_postprocess_to_chunks(&self, texts: Vec<String>, is_whisper: bool) -> String {
+        if texts.is_empty() {
+            return String::new();
+        }
+
+        let settings = get_settings(&self.app_handle);
+
+        let joined = if is_whisper {
+            texts.join(" ")
+        } else {
+            join_chunks_heuristic(&texts)
+        };
+
+        let corrected = if !settings.custom_words.is_empty() && !is_whisper {
+            apply_custom_words(
+                &joined,
+                &settings.custom_words,
+                settings.word_correction_threshold,
+            )
+        } else {
+            joined
+        };
+
+        filter_transcription_output(
+            &corrected,
+            &settings.app_language,
+            &settings.custom_filler_words,
+        )
+    }
+}
+
+/// Join chunk texts for non-Whisper engines that don't support `initial_prompt`.
+///
+/// Strips sentence-ending punctuation from the end of each accumulated text,
+/// then lowercases the first character of the next chunk before appending.
+/// This avoids "…sentence. Next sentence" artifacts at boundaries.
+fn join_chunks_heuristic(chunks: &[String]) -> String {
+    if chunks.is_empty() {
+        return String::new();
+    }
+
+    let mut result = chunks[0].trim_end().to_string();
+
+    for chunk in &chunks[1..] {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+
+        // Drop trailing sentence-end punctuation so we can continue mid-thought.
+        let base = result
+            .trim_end_matches(|c| matches!(c, '.' | '!' | '?' | ',' | ';'))
+            .trim_end();
+
+        // Lowercase the opening character of the continuation chunk.
+        let first = chunk.chars().next().unwrap_or(' ');
+        let lowercased = if first.is_uppercase() {
+            let first_lower: String = first.to_lowercase().collect();
+            format!("{}{}", first_lower, &chunk[first.len_utf8()..])
+        } else {
+            chunk.to_string()
+        };
+
+        result = format!("{} {}", base, lowercased);
+    }
+
+    result
 }
 
 /// Apply the user's accelerator preferences to the transcribe-rs global atomics.

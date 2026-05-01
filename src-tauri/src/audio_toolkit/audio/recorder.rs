@@ -21,8 +21,10 @@ use crate::audio_toolkit::{
 };
 
 enum Cmd {
-    Start,
-    Stop(mpsc::Sender<Vec<f32>>),
+    /// `None` = non-streaming (accumulate locally); `Some(tx)` = streaming
+    /// (clone each completed chunk to the pipeline thread via `tx`).
+    Start(Option<mpsc::Sender<Vec<f32>>>),
+    Stop(mpsc::Sender<Vec<Vec<f32>>>),
     Shutdown,
 }
 
@@ -37,6 +39,8 @@ pub struct AudioRecorder {
     worker_handle: Option<std::thread::JoinHandle<()>>,
     vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
+    /// 0 = no chunking; >0 = emit a new chunk every N samples (at 16kHz).
+    chunk_threshold: usize,
 }
 
 impl AudioRecorder {
@@ -47,7 +51,18 @@ impl AudioRecorder {
             worker_handle: None,
             vad: None,
             level_cb: None,
+            chunk_threshold: 0,
         })
+    }
+
+    /// Emit a new audio chunk every `seconds` seconds of recorded (VAD-filtered)
+    /// audio. Chunks are returned by [`stop`] in order; the final call returns
+    /// whatever remains (may be shorter than `seconds`). Set `seconds = 0` to
+    /// disable chunking (the default — returns a single-element `Vec`).
+    pub fn with_chunk_duration_s(mut self, seconds: u32) -> Self {
+        self.chunk_threshold =
+            crate::audio_toolkit::constants::WHISPER_SAMPLE_RATE as usize * seconds as usize;
+        self
     }
 
     pub fn with_vad(mut self, vad: Box<dyn VoiceActivityDetector>) -> Self {
@@ -84,6 +99,7 @@ impl AudioRecorder {
         let vad = self.vad.clone();
         // Move the optional level callback into the worker thread
         let level_cb = self.level_cb.clone();
+        let chunk_threshold = self.chunk_threshold;
 
         let worker = std::thread::spawn(move || {
             let stop_flag = Arc::new(AtomicBool::new(false));
@@ -160,7 +176,15 @@ impl AudioRecorder {
                 Ok((stream, sample_rate)) => {
                     let _ = init_tx.send(Ok(()));
                     // Keep the stream alive while we process samples.
-                    run_consumer(sample_rate, vad, sample_rx, cmd_rx, level_cb, stop_flag);
+                    run_consumer(
+                        sample_rate,
+                        chunk_threshold,
+                        vad,
+                        sample_rx,
+                        cmd_rx,
+                        level_cb,
+                        stop_flag,
+                    );
                     drop(stream);
                 }
                 Err(error_message) => {
@@ -198,17 +222,36 @@ impl AudioRecorder {
 
     pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(tx) = &self.cmd_tx {
-            tx.send(Cmd::Start)?;
+            tx.send(Cmd::Start(None))?;
         }
         Ok(())
     }
 
-    pub fn stop(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        let (resp_tx, resp_rx) = mpsc::channel();
+    /// Like [`start`] but each completed audio chunk is also cloned to
+    /// `chunk_tx` as soon as it fills up, so a pipeline thread can begin
+    /// transcribing chunk N while the microphone keeps recording chunk N+1.
+    /// All chunks are still kept in `pending_chunks` internally and returned
+    /// by [`stop`] for WAV saving.
+    pub fn start_streaming(
+        &self,
+        chunk_tx: mpsc::Sender<Vec<f32>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(Cmd::Start(Some(chunk_tx)))?;
+        }
+        Ok(())
+    }
+
+    /// Stop recording and return all audio chunks. Without chunking (default),
+    /// returns a single-element `Vec` containing all recorded samples.
+    /// With chunking enabled via [`with_chunk_duration_s`], returns one element
+    /// per full chunk plus a final element for any remaining samples.
+    pub fn stop(&self) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        let (resp_tx, resp_rx) = mpsc::channel::<Vec<Vec<f32>>>();
         if let Some(tx) = &self.cmd_tx {
             tx.send(Cmd::Stop(resp_tx))?;
         }
-        Ok(resp_rx.recv()?) // wait for the samples
+        Ok(resp_rx.recv()?)
     }
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -544,8 +587,27 @@ impl PreRollBuffer {
 /// (~19KB). Tunable; see `.planning/chord-system.md` open question (2).
 const PREROLL_MS: u32 = 300;
 
+/// Dispatch a completed audio chunk: always push to `pending_chunks` (for WAV
+/// saving), and in streaming mode also clone it to the pipeline thread via
+/// `live_chunk_tx`. If the receiver has been dropped the sender is cleared and
+/// we fall back to local-only accumulation for the rest of the recording.
+fn dispatch_chunk(
+    chunk: Vec<f32>,
+    live_chunk_tx: &mut Option<mpsc::Sender<Vec<f32>>>,
+    pending_chunks: &mut Vec<Vec<f32>>,
+) {
+    if let Some(ref tx) = *live_chunk_tx {
+        if tx.send(chunk.clone()).is_err() {
+            log::warn!("Streaming pipeline disconnected; falling back to local accumulation");
+            *live_chunk_tx = None;
+        }
+    }
+    pending_chunks.push(chunk);
+}
+
 fn run_consumer(
     in_sample_rate: u32,
+    chunk_threshold: usize,
     vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
     sample_rx: mpsc::Receiver<AudioChunk>,
     cmd_rx: mpsc::Receiver<Cmd>,
@@ -561,6 +623,10 @@ fn run_consumer(
     let preroll_target = (constants::WHISPER_SAMPLE_RATE * PREROLL_MS / 1000) as usize;
     let mut preroll = PreRollBuffer::new(preroll_target);
     let mut processed_samples = Vec::<f32>::new();
+    let mut pending_chunks: Vec<Vec<f32>> = Vec::new();
+    /// In streaming mode this holds the pipeline thread's sender; `None` in
+    /// non-streaming mode.  Dropping it signals EOF to the pipeline receiver.
+    let mut live_chunk_tx: Option<mpsc::Sender<Vec<f32>>> = None;
     let mut recording = false;
 
     // ---------- spectrum visualisation setup ---------------------------- //
@@ -582,9 +648,6 @@ fn run_consumer(
         preroll: &mut PreRollBuffer,
     ) {
         if !recording {
-            // Stash recent audio so the chord-system can splice the
-            // pre-recording window into the start of the eventual recording.
-            // VAD is intentionally not applied here — see PreRollBuffer docs.
             preroll.push(samples);
             return;
         }
@@ -618,17 +681,28 @@ fn run_consumer(
             }
         }
 
-        // ---------- existing pipeline ------------------------------------ //
+        // ---------- pipeline -------------------------------------------- //
         frame_resampler.push(&raw, &mut |frame: &[f32]| {
             handle_frame(frame, recording, &vad, &mut processed_samples, &mut preroll)
         });
 
+        // Dispatch completed chunks (streaming: clone to pipeline + keep for
+        // WAV; non-streaming: accumulate locally only).
+        if chunk_threshold > 0 && recording {
+            while processed_samples.len() >= chunk_threshold {
+                let chunk: Vec<f32> = processed_samples.drain(..chunk_threshold).collect();
+                dispatch_chunk(chunk, &mut live_chunk_tx, &mut pending_chunks);
+            }
+        }
+
         // non-blocking check for a command
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                Cmd::Start => {
+                Cmd::Start(chunk_tx_opt) => {
                     stop_flag.store(false, Ordering::Relaxed);
                     processed_samples.clear();
+                    pending_chunks.clear();
+                    live_chunk_tx = chunk_tx_opt;
                     // Splice the chord-window's audio into the start of the
                     // recording so the user's first words aren't lost to the
                     // 200ms chord-resolve latency.
@@ -659,6 +733,14 @@ fn run_consumer(
                                         &mut preroll,
                                     )
                                 });
+                                // Dispatch any newly completed chunks from the drain.
+                                if chunk_threshold > 0 {
+                                    while processed_samples.len() >= chunk_threshold {
+                                        let c: Vec<f32> =
+                                            processed_samples.drain(..chunk_threshold).collect();
+                                        dispatch_chunk(c, &mut live_chunk_tx, &mut pending_chunks);
+                                    }
+                                }
                             }
                             Ok(AudioChunk::EndOfStream) => break,
                             Err(_) => {
@@ -672,7 +754,28 @@ fn run_consumer(
                         handle_frame(frame, true, &vad, &mut processed_samples, &mut preroll)
                     });
 
-                    let _ = reply_tx.send(std::mem::take(&mut processed_samples));
+                    // Drain any full chunks produced by the final resampler flush.
+                    if chunk_threshold > 0 {
+                        while processed_samples.len() >= chunk_threshold {
+                            let c: Vec<f32> = processed_samples.drain(..chunk_threshold).collect();
+                            dispatch_chunk(c, &mut live_chunk_tx, &mut pending_chunks);
+                        }
+                    }
+
+                    // Final partial chunk (or entire audio when chunking is off).
+                    let remaining = std::mem::take(&mut processed_samples);
+                    if !remaining.is_empty() || pending_chunks.is_empty() {
+                        dispatch_chunk(remaining, &mut live_chunk_tx, &mut pending_chunks);
+                    }
+
+                    // Drop the pipeline sender — this closes the channel and
+                    // signals EOF to the pipeline thread (which then exits its
+                    // recv loop and the JoinHandle becomes joinable).
+                    live_chunk_tx = None;
+
+                    // Return pending_chunks — contains all audio regardless of
+                    // streaming mode, used by the caller for WAV saving.
+                    let _ = reply_tx.send(std::mem::take(&mut pending_chunks));
 
                     // Resume the audio callback so the consumer loop can continue
                     // receiving chunks (important for always-on microphone mode).

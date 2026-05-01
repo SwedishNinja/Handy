@@ -467,6 +467,11 @@ pub struct AppSettings {
     pub whisper_gpu_device: i32,
     #[serde(default)]
     pub extra_recording_buffer_ms: u64,
+    /// Split recordings into chunks of this many seconds and transcribe each chunk
+    /// sequentially with context carry-forward to avoid mid-sentence punctuation.
+    /// `None` disables chunking (full audio transcribed at once).
+    #[serde(default)]
+    pub streaming_chunk_duration_s: Option<u32>,
 }
 
 fn default_model() -> String {
@@ -894,6 +899,7 @@ pub fn get_default_settings() -> AppSettings {
         ort_accelerator: OrtAcceleratorSetting::default(),
         whisper_gpu_device: default_whisper_gpu_device(),
         extra_recording_buffer_ms: 0,
+        streaming_chunk_duration_s: None,
     }
 }
 

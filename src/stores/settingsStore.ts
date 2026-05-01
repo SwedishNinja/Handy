@@ -155,6 +155,8 @@ const settingUpdaters: {
     commands.changeWhisperGpuDevice(value as number),
   extra_recording_buffer_ms: (value) =>
     commands.changeExtraRecordingBufferSetting(value as number),
+  streaming_chunk_duration_s: (value) =>
+    commands.changeStreamingChunkDurationSetting(value as number | null),
 };
 
 export const useSettingsStore = create<SettingsStore>()(

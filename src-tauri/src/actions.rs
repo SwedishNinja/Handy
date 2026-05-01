@@ -13,7 +13,7 @@ use crate::utils::{
 };
 use crate::TranscriptionCoordinator;
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -422,6 +422,32 @@ impl ShortcutAction for TranscribeAction {
         let is_always_on = settings.always_on_microphone;
         debug!("Microphone mode - always_on: {}", is_always_on);
 
+        // If streaming chunks are enabled, wire up a pipeline thread that
+        // transcribes each chunk as it arrives while the mic keeps recording.
+        let streaming_chunk_s = settings.streaming_chunk_duration_s.unwrap_or(0);
+        let chunk_tx_opt: Option<std::sync::mpsc::Sender<Vec<f32>>> = if streaming_chunk_s > 0 {
+            let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+            let is_whisper = tm.is_whisper_engine();
+            let tm_pipeline = Arc::clone(&tm);
+
+            let pipeline_thread =
+                std::thread::spawn(move || tm_pipeline.run_streaming_pipeline(chunk_rx));
+
+            let streaming_state = app.state::<crate::streaming::StreamingState>();
+            streaming_state.store(crate::streaming::StreamingHandle {
+                thread: pipeline_thread,
+                is_whisper,
+            });
+
+            info!(
+                "Streaming pipeline started (chunk_duration={}s, is_whisper={})",
+                streaming_chunk_s, is_whisper
+            );
+            Some(chunk_tx)
+        } else {
+            None
+        };
+
         let mut recording_error: Option<String> = None;
         if is_always_on {
             // Always-on mode: Play audio feedback immediately, then apply mute after sound finishes
@@ -435,7 +461,11 @@ impl ShortcutAction for TranscribeAction {
                 rm_clone.apply_mute();
             });
 
-            if let Err(e) = rm.try_start_recording(&binding_id) {
+            let result = match chunk_tx_opt {
+                Some(tx) => rm.try_start_recording_streaming(&binding_id, tx),
+                None => rm.try_start_recording(&binding_id),
+            };
+            if let Err(e) = result {
                 debug!("Recording failed: {}", e);
                 recording_error = Some(e);
             }
@@ -444,7 +474,11 @@ impl ShortcutAction for TranscribeAction {
             // This allows the microphone to be activated before playing the sound
             debug!("On-demand mode: Starting recording first, then audio feedback");
             let recording_start_time = Instant::now();
-            match rm.try_start_recording(&binding_id) {
+            let result = match chunk_tx_opt {
+                Some(tx) => rm.try_start_recording_streaming(&binding_id, tx),
+                None => rm.try_start_recording(&binding_id),
+            };
+            match result {
                 Ok(()) => {
                     debug!("Recording started in {:?}", recording_start_time.elapsed());
                     // Small delay to ensure microphone stream is active
@@ -470,7 +504,9 @@ impl ShortcutAction for TranscribeAction {
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
         } else {
-            // Starting failed (for example due to blocked microphone permissions).
+            // Starting failed — discard any in-flight streaming handle so it
+            // doesn't leak into the next recording attempt.
+            app.state::<crate::streaming::StreamingState>().take();
             // Revert UI state so we don't stay stuck in the recording overlay.
             utils::hide_recording_overlay(app);
             change_tray_icon(app, TrayIconState::Idle);
@@ -533,31 +569,61 @@ impl ShortcutAction for TranscribeAction {
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id) {
+            if let Some(chunks) = rm.stop_recording(&binding_id) {
+                let total_samples: usize = chunks.iter().map(|c| c.len()).sum();
                 debug!(
-                    "Recording stopped and samples retrieved in {:?}, sample count: {}",
+                    "Recording stopped and samples retrieved in {:?}, total samples: {} ({} chunk(s))",
                     stop_recording_time.elapsed(),
-                    samples.len()
+                    total_samples,
+                    chunks.len(),
                 );
 
-                if samples.is_empty() {
+                if total_samples == 0 {
                     debug!("Recording produced no audio samples; skipping persistence");
                     utils::hide_recording_overlay(&ah);
                     change_tray_icon(&ah, TrayIconState::Idle);
                 } else {
+                    // Flatten chunks for WAV saving (always saved as a single file).
+                    let samples_flat: Vec<f32> = chunks.iter().flatten().cloned().collect();
+                    let sample_count = samples_flat.len();
+
                     // Save WAV concurrently with transcription
-                    let sample_count = samples.len();
                     let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
                     let wav_path = hm.recordings_dir().join(&file_name);
                     let wav_path_for_verify = wav_path.clone();
-                    let samples_for_wav = samples.clone();
                     let wav_handle = tauri::async_runtime::spawn_blocking(move || {
-                        crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+                        crate::audio_toolkit::save_wav_file(&wav_path, &samples_flat)
                     });
 
-                    // Transcribe concurrently with WAV save
+                    // Transcribe — either via the live streaming pipeline (if
+                    // it was started at recording-start time) or by processing
+                    // all chunks now (V1 / non-streaming path).
                     let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe(samples);
+                    let streaming_state = ah.state::<crate::streaming::StreamingState>();
+                    let transcription_result = if let Some(pipeline) = streaming_state.take() {
+                        // stop_recording() already sent the final chunk and dropped the
+                        // sender, so the pipeline thread is finishing its last call now.
+                        tauri::async_runtime::spawn_blocking(move || match pipeline.thread.join() {
+                            Ok(Ok(texts)) => {
+                                info!(
+                                    "Streaming pipeline joined: {} chunk(s) transcribed",
+                                    texts.len()
+                                );
+                                let result =
+                                    tm.apply_postprocess_to_chunks(texts, pipeline.is_whisper);
+                                Ok(result)
+                            }
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(anyhow::anyhow!("Streaming pipeline thread panicked")),
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(anyhow::anyhow!("Pipeline join task failed: {}", e))
+                        })
+                    } else {
+                        // Non-streaming: transcribe all chunks now.
+                        tm.transcribe_chunks(chunks)
+                    };
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {

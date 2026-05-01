@@ -121,13 +121,15 @@ fn create_audio_recorder(
     vad_path: &str,
     app_handle: &tauri::AppHandle,
 ) -> Result<AudioRecorder, anyhow::Error> {
+    let settings = get_settings(app_handle);
+
     let silero = SileroVad::new(vad_path, 0.3)
         .map_err(|e| anyhow::anyhow!("Failed to create SileroVad: {}", e))?;
     let smoothed_vad = SmoothedVad::new(Box::new(silero), 15, 15, 2);
 
     // Recorder with VAD plus a spectrum-level callback that forwards updates to
     // the frontend.
-    let recorder = AudioRecorder::new()
+    let mut recorder = AudioRecorder::new()
         .map_err(|e| anyhow::anyhow!("Failed to create AudioRecorder: {}", e))?
         .with_vad(Box::new(smoothed_vad))
         .with_level_callback({
@@ -136,6 +138,12 @@ fn create_audio_recorder(
                 utils::emit_levels(&app_handle, &levels);
             }
         });
+
+    if let Some(chunk_s) = settings.streaming_chunk_duration_s {
+        if chunk_s > 0 {
+            recorder = recorder.with_chunk_duration_s(chunk_s);
+        }
+    }
 
     Ok(recorder)
 }
@@ -384,6 +392,26 @@ impl AudioRecordingManager {
     /* ---------- recording --------------------------------------------------- */
 
     pub fn try_start_recording(&self, binding_id: &str) -> Result<(), String> {
+        self.try_start_recording_impl(binding_id, None)
+    }
+
+    /// Like [`try_start_recording`] but enables the streaming pipeline: each
+    /// completed audio chunk is cloned to `chunk_tx` as soon as it fills up so
+    /// a background thread can begin transcribing immediately. All audio is
+    /// still returned by [`stop_recording`] for WAV saving.
+    pub fn try_start_recording_streaming(
+        &self,
+        binding_id: &str,
+        chunk_tx: std::sync::mpsc::Sender<Vec<f32>>,
+    ) -> Result<(), String> {
+        self.try_start_recording_impl(binding_id, Some(chunk_tx))
+    }
+
+    fn try_start_recording_impl(
+        &self,
+        binding_id: &str,
+        chunk_tx: Option<std::sync::mpsc::Sender<Vec<f32>>>,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().unwrap();
 
         if let RecordingState::Idle = *state {
@@ -399,7 +427,11 @@ impl AudioRecordingManager {
             }
 
             if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                if rec.start().is_ok() {
+                let started = match chunk_tx {
+                    Some(tx) => rec.start_streaming(tx).is_ok(),
+                    None => rec.start().is_ok(),
+                };
+                if started {
                     *self.is_recording.lock().unwrap() = true;
                     *state = RecordingState::Recording {
                         binding_id: binding_id.to_string(),
@@ -424,7 +456,10 @@ impl AudioRecordingManager {
         Ok(())
     }
 
-    pub fn stop_recording(&self, binding_id: &str) -> Option<Vec<f32>> {
+    /// Stop recording and return audio chunks. Without chunking (default),
+    /// returns a single-element `Vec` containing the full recording. With
+    /// chunking, returns one element per full chunk plus the trailing partial.
+    pub fn stop_recording(&self, binding_id: &str) -> Option<Vec<Vec<f32>>> {
         let mut state = self.state.lock().unwrap();
 
         match *state {
@@ -444,17 +479,17 @@ impl AudioRecordingManager {
                     std::thread::sleep(Duration::from_millis(settings.extra_recording_buffer_ms));
                 }
 
-                let samples = if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+                let mut chunks = if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
                     match rec.stop() {
-                        Ok(buf) => buf,
+                        Ok(chunks) => chunks,
                         Err(e) => {
                             error!("stop() failed: {e}");
-                            Vec::new()
+                            vec![Vec::new()]
                         }
                     }
                 } else {
                     error!("Recorder not available");
-                    Vec::new()
+                    vec![Vec::new()]
                 };
 
                 *self.is_recording.lock().unwrap() = false;
@@ -468,16 +503,17 @@ impl AudioRecordingManager {
                     }
                 }
 
-                // Pad if very short
-                let s_len = samples.len();
-                // debug!("Got {} samples", s_len);
-                if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
-                    let mut padded = samples;
-                    padded.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
-                    Some(padded)
-                } else {
-                    Some(samples)
+                // Pad if total recording is very short (< 1s).  Only applies to
+                // the common single-chunk case; for multi-chunk recordings each
+                // chunk is already ≥ chunk_threshold (≥ 10 s by default) so
+                // padding would be wrong.  We also skip padding empty recordings.
+                let total_samples: usize = chunks.iter().map(|c| c.len()).sum();
+                if total_samples > 0 && total_samples < WHISPER_SAMPLE_RATE && chunks.len() == 1 {
+                    let padded_len = WHISPER_SAMPLE_RATE * 5 / 4;
+                    chunks[0].resize(padded_len, 0.0);
                 }
+
+                Some(chunks)
             }
             _ => None,
         }
